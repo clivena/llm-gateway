@@ -1,0 +1,14 @@
+# 提交到仓库的模板（不含真实密钥），方便协作方复制成 application-local.yml
+# 用法：cp application-local.yml.example application-local.yml 然后填入自己的 key
+
+gateway:
+  cache:
+    enabled: false          # DeepSeek 无 embedding 接口，先关闭语义缓存
+  providers:
+    - name: openai          # 必须叫 openai（OpenAI 兼容协议标识）
+      base-url: https://api.deepseek.com/v1
+      api-key: "sk-替换成你自己的key"
+      embedding-model: ""
+      models:
+        - deepseek-flash
+        - deepseek-v4-pro

@@ -1,0 +1,17 @@
+target/
+build/
+out/
+.idea/
+.vscode/
+*.iml
+*.log
+.env
+.DS_Store
+
+# 本地私有配置（含 API key），绝不提交
+config/application-local.yml
+config/application-local.yaml
+
+# Python 脚本运行/编译产生的缓存
+__pycache__/
+*.pyc

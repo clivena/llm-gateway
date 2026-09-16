@@ -1,0 +1,105 @@
+package com.llmgw.api;
+
+import com.llmgw.config.GatewayProperties;
+import com.llmgw.core.cost.CostLedgerRepository;
+import com.llmgw.core.quota.QuotaService;
+import org.springframework.r2dbc.core.DatabaseClient;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * 只读运维接口，给 dashboard 提供真实数据。
+ *
+ * 设计约束：
+ * 1. 全部只读——不扣配额、不写账本、不改配置，因此不会影响 /v1 主链路的任何语义；
+ * 2. 与对话链路完全隔离——这个 Controller 挂了不影响网关对外服务（反过来也一样：
+ *    Redis/Postgres 挂了这里会如实报错，前端据此降级到内置样例数据，而不是显示一个"看起来正常的空表"）。
+ */
+@RestController
+@RequestMapping("/admin")
+public class AdminController {
+
+    private final CostLedgerRepository ledger;
+    private final QuotaService quota;
+    private final GatewayProperties properties;
+    private final DatabaseClient db;
+
+    public AdminController(CostLedgerRepository ledger, QuotaService quota,
+                           GatewayProperties properties, DatabaseClient db) {
+        this.ledger = ledger;
+        this.quota = quota;
+        this.properties = properties;
+        this.db = db;
+    }
+
+    /** 账本明细，按 id 倒序。limit 收口在 1~200，避免被当成"全表导出"接口用。 */
+    @GetMapping("/ledger/recent")
+    public Flux<Map<String, Object>> recent(@RequestParam(defaultValue = "20") int limit) {
+        return ledger.recent(Math.min(Math.max(limit, 1), 200));
+    }
+
+    /** 账本按租户汇总（对账口径）。 */
+    @GetMapping("/ledger/summary")
+    public Flux<Map<String, Object>> summary() {
+        return ledger.summaryByApiKey();
+    }
+
+    /** 指定租户当前周期的配额使用情况。 */
+    @GetMapping("/quota/{apiKey}")
+    public Mono<Map<String, Object>> quotaOf(@PathVariable String apiKey) {
+        return quota.currentUsage(apiKey);
+    }
+
+    /** 当前生效的策略与单价表——面板上"为什么是这个价"的依据。 */
+    @GetMapping("/pricing")
+    public Mono<Map<String, Object>> pricing() {
+        Map<String, Object> prices = new LinkedHashMap<>();
+        properties.getPricing().forEach((model, p) -> {
+            Map<String, Object> one = new LinkedHashMap<>();
+            one.put("inputPer1k", p.getInputPer1k());
+            one.put("outputPer1k", p.getOutputPer1k());
+            prices.put(model, one);
+        });
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("pricing", prices);
+        out.put("routerPolicy", properties.getRouter().getPolicy());
+        out.put("cacheEnabled", properties.getCache().isEnabled());
+        out.put("similarityThreshold", properties.getCache().getSimilarityThreshold());
+        out.put("costSink", properties.getCost().getSink());
+        out.put("quotaLimitTokens", properties.getQuota().getDefaultLimitTokens());
+        return Mono.just(out);
+    }
+
+    /**
+     * 依赖健康检查。两项探测都 onErrorResume 成 false——
+     * 面板的意义是"告诉人哪里坏了"，而不是自己跟着一起 500。
+     */
+    @GetMapping("/status")
+    public Mono<Map<String, Object>> status() {
+        Mono<Boolean> redisOk = quota.ping().onErrorResume(e -> Mono.just(false));
+        Mono<Boolean> postgresOk = db.sql("SELECT 1 AS ok").fetch().one()
+                .map(row -> true)
+                .onErrorResume(e -> Mono.just(false));
+
+        return Mono.zip(redisOk, postgresOk).map(t -> {
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("gateway", true);
+            out.put("redis", t.getT1());
+            out.put("postgres", t.getT2());
+            out.put("routerPolicy", properties.getRouter().getPolicy());
+            out.put("cacheEnabled", properties.getCache().isEnabled());
+            out.put("costSink", properties.getCost().getSink());
+            out.put("quotaLimitTokens", properties.getQuota().getDefaultLimitTokens());
+            return out;
+        });
+    }
+}

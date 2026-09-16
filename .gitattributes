@@ -1,0 +1,12 @@
+# 统一换行符，避免 Windows 开发 / Linux CI 之间产生无意义的 diff
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制资源
+*.jar binary
+*.png binary
+*.jpg binary
+*.ico binary

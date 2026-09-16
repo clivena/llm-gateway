@@ -1,0 +1,75 @@
+server:
+  port: 8080
+
+spring:
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: 6379
+  # 成本账本落库（Postgres / R2DBC）。连接是惰性的：Postgres 没起时应用照样能启动，
+  # 只在真正写账本时失败并记日志，不影响主链路。
+  # ★ 宿主端口是 55432 不是 5432：本机有 PostgreSQL 10 的 Windows 服务占着 5432，
+  #   用 5432 会连到那个原生实例（没有 llmgw 库）而报 Connection reset。
+  r2dbc:
+    url: ${POSTGRES_R2DBC_URL:r2dbc:postgresql://localhost:55432/llmgw}
+    username: ${POSTGRES_USER:postgres}
+    password: ${POSTGRES_PASSWORD:postgres}
+    pool:
+      enabled: true
+      initial-size: 2
+      max-size: 8
+      max-idle-time: 30s
+  kafka:
+    bootstrap-servers: ${KAFKA_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        # 关键：KafkaTemplate.send() 在 broker 不可达时会阻塞到 max.block.ms（默认 60000ms）
+        # 才抛 TimeoutException。所谓"异步发送"因此会把响应一起拖住——实测每个请求多花 60s。
+        # 压到 500ms 让它在不可用时快速失败，配合 ChatPipeline 里独立线程落账，彻底离开响应路径。
+        max.block.ms: 500
+
+gateway:
+  # 账本落库方式：postgres（直写，开箱可用、可立刻对账）| kafka（流式，生产链路）| both
+  # 默认 postgres：配合 docker compose 起来的 Postgres 即可闭环。
+  # 生产上通常改成 kafka/both，让账本先进消息队列再由消费者入仓。
+  cost:
+    sink: ${COST_SINK:postgres}
+  cache:
+    enabled: true
+    similarity-threshold: 0.92
+    ttl-seconds: 3600
+    max-entries-per-namespace: 500
+  quota:
+    default-limit-tokens: 200000
+    period-ttl-seconds: 3024000
+  router:
+    policy: COST_FIRST
+  # 计费单价（元 / 1K tokens）。★ 示例值，请按你自己的实际账单口径替换。
+  # 没有配置单价的模型，会回退到 ModelTier.costPer1k 按总 token 估算。
+  pricing:
+    deepseek-flash:
+      input-per-1k: 0.0005
+      output-per-1k: 0.0015
+    deepseek-v4-pro:
+      input-per-1k: 0.0020
+      output-per-1k: 0.0080
+    gpt-4o-mini:
+      input-per-1k: 0.0010
+      output-per-1k: 0.0030
+    gpt-4o:
+      input-per-1k: 0.0200
+      output-per-1k: 0.0600
+  providers:
+    - name: openai
+      base-url: ${OPENAI_BASE_URL:https://api.openai.com/v1}
+      api-key: ${OPENAI_API_KEY:}
+      embedding-model: ${OPENAI_EMBEDDING_MODEL:text-embedding-3-small}
+      models: [gpt-4o-mini, gpt-4o]
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus

@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-16T14:49:37",
+  "generatedAt": "2026-09-16T18:51:52",
   "model": "stub",
   "casesFile": "smoke.yaml",
   "runs": [
@@ -8,9 +8,11 @@
       "total": 3,
       "passed": 0,
       "pass_rate": 0.0,
-      "mean_score": 0.27777777777777773,
+      "mean_score": 0.3277666666666667,
       "cost_total": 0.0,
-      "p95_latency_ms": 0
+      "p95_latency_ms": 0,
+      "prompt_tokens": 18,
+      "completion_tokens": 27
     }
   ],
   "cases": [
@@ -58,7 +60,7 @@
       "caseId": "short-answer-quality",
       "runKey": "v1|stub|r0",
       "passed": false,
-      "meanScore": 0.3333,
+      "meanScore": 0.4833,
       "latencyMs": 0,
       "cost": 0.0,
       "answer": "[stub:stub] 用一句话说明什么是 TCP 三次握手。",
@@ -72,11 +74,11 @@
         {
           "scorer": "semantic",
           "passed": false,
-          "score": 0.0,
-          "detail": "case.expected is empty, cannot score semantic"
+          "score": 0.4499,
+          "detail": "sim=0.4499 threshold=0.5"
         },
         {
-          "scorer": "judge:0:0",
+          "scorer": "judge:stub:0",
           "passed": false,
           "score": 0.0,
           "detail": "unparsable judge output"
@@ -89,6 +91,7 @@
     "kappa": 0.6571,
     "threshold": 0.7,
     "reliable": false,
+    "degenerate": false,
     "confusion": {
       "TP": 6,
       "FP": 1,

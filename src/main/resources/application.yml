@@ -82,6 +82,18 @@ gateway:
       failure-rate-threshold: 50
       wait-duration-in-open-state-millis: 10000
       permitted-number-of-calls-in-half-open-state: 3
+    # 跨 provider 故障转移（F2）。前置条件是同一个 model 名被多家 provider 声明 ——
+    # 那些 provider 按上面 providers[] 的声明顺序组成候选链，链首优先。
+    # ★ 只有一家 provider 时这个配置块完全无效（没有第二个候选可转移），
+    #   所以它是"部署了几家"才生效的能力，不是一条永远在跑的兜底逻辑。
+    failover:
+      enabled: true
+      # 最多试几家（含链首）。默认 2 = 主力 + 1 个备选。
+      max-providers: 2
+      # ★ 一次请求内允许发起的**上游调用总次数**（跨 provider 累计，含首次）。
+      #   它和 retry.max-attempts 是相乘关系：3 次 × 3 家 = 9 次真实计费调用。
+      #   这个上限就是用来把那个乘法关在盒子里的 —— 别只调大它，要一起想。
+      max-total-attempts: 4
   # Token 估算系数 —— 配额预扣与兜底计费共用这一套口径。
   # ★ 这些是**实测校准值**，不是经验常数：token 数由上游的分词器决定，随供应商与
   #   模型版本变化。当前值来自 2026-10-16 对 deepseek-flash 的真机实测

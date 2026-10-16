@@ -19,6 +19,7 @@ import reactor.test.StepVerifier;
 import java.net.ConnectException;
 import java.net.URI;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -96,8 +97,106 @@ class UpstreamResilienceTest {
         assertFalse(UpstreamResilience.retryable(null));
     }
 
-    // --- 重试：次数与异常传递 ---
+    // --- F2：转移谓词与重试谓词的关系 ---
 
+    /**
+     * {@code failoverable = retryable ∪ {熔断打开}} —— 这个**包含关系**是本条断言的全部内容。
+     *
+     * <p>三条一起看才说明问题：
+     * <ol>
+     *   <li>能重试的必须能转移（同一家再试一次可能好，那换一家就更可能好）；</li>
+     *   <li>熔断打开能转移但<b>不能</b>重试 —— 重试仍进不去熔断器，只会空转烧预算，
+     *       而换一家是完全不同的一条链路，那家好好的就该让它上；</li>
+     *   <li>确定性错误两者都不做（换家会拿到一模一样的错）。</li>
+     * </ol>
+     *
+     * <p>把第 2 条单独钉住是有必要的：很容易顺手写成
+     * {@code failoverable = retryable}（"熔断打开也算一种错嘛"），
+     * 那样一次链路故障仍然等于整站失败 —— 熔断加上了，故障转移却永远不生效。
+     */
+    @Test
+    void failoverPredicateIsRetryPredicatePlusCircuitOpen() {
+        // 1) 能重试的都能转移
+        assertTrue(UpstreamResilience.failoverable(status(500)), "5xx：换一家可能就好了");
+        assertTrue(UpstreamResilience.failoverable(status(429)), "429：这家在限流，换一家不一定");
+        assertTrue(UpstreamResilience.failoverable(connectRefused()), "连不上这家");
+        assertTrue(UpstreamResilience.failoverable(new TimeoutException()));
+        assertTrue(UpstreamResilience.failoverable(new UpstreamEmptyBodyException("m")));
+        assertTrue(UpstreamResilience.failoverable(new UpstreamEmptyResponseException(emptyAnswer())),
+                "空正文是模型侧的问题，换个部署很可能就正常了");
+
+        // 2) 熔断打开：可转移但不可重试 —— 差集就在这里
+        UpstreamCircuitOpenException open =
+                new UpstreamCircuitOpenException(PROVIDER, new RuntimeException("not permitted"));
+        assertTrue(UpstreamResilience.failoverable(open), "这家不问了，那就去问下一家");
+        assertFalse(UpstreamResilience.retryable(open),
+                "原地重试进不去熔断器，只会空转并烧掉重试预算");
+
+        // 3) 确定性错误：两者都不做
+        assertFalse(UpstreamResilience.failoverable(status(400)), "换一家还是 400，请求本身不对");
+        assertFalse(UpstreamResilience.failoverable(status(401)));
+        assertFalse(UpstreamResilience.failoverable(new IllegalArgumentException("messages 不能为空")));
+        assertFalse(UpstreamResilience.failoverable(new IllegalStateException("没见过的错误")),
+                "白名单之外一律不转移 —— 转移是要花钱的，看不懂的错误不该触发它");
+        assertFalse(UpstreamResilience.failoverable(null));
+    }
+
+    /** 整条候选链都不可用时造的错，provider() 里是逗号分隔的名单。 */
+    @Test
+    void allCandidatesUnavailableCarriesTheWholeChain() {
+        UpstreamCircuitOpenException e =
+                UpstreamCircuitOpenException.allCandidatesUnavailable("m", List.of("a", "b"));
+
+        assertEquals("a,b", e.provider(), "客户端与运维最需要知道的是'哪些链路一起黑了'");
+        assertTrue(e.getMessage().contains("m"), e.getMessage());
+    }
+
+    /**
+     * 候选链可调用性：OPEN 要跳过，但 <b>HALF_OPEN 必须放行</b>。
+     *
+     * <p>把 HALF_OPEN 一并跳过会造出一个永远不会自愈的黑洞：半开的定义就是
+     * "放几个探针看看恢复了没"，探针被我们跳过了，熔断器永远等不到那几次成功，
+     * 永远回不到 CLOSED —— 而表面症状只是"流量都走到了备选"，
+     * 首选链路明明是好的也没人用，排查时完全指不到这里。
+     *
+     * <p>所以这里用**短等待期**把状态真的推到 HALF_OPEN 再断言
+     * （而不是断言一个"半开应该算可用"的常量）—— 前者能发现实现变了，
+     * 后者只能发现枚举名字变了。
+     */
+    @Test
+    void openProviderIsSkippedButHalfOpenIsStillCallable() {
+        var cb = props.getResilience().getCircuitBreaker();
+        cb.setSlidingWindowSize(2);
+        cb.setMinimumNumberOfCalls(2);
+        cb.setWaitDurationInOpenStateMillis(30);
+        UpstreamResilience shortWait =
+                new UpstreamResilience(props, new GatewayMetrics(new SimpleMeterRegistry()));
+
+        assertTrue(shortWait.callable(PROVIDER), "新 provider 默认 CLOSED，当然可以调");
+
+        for (int i = 0; i < 2; i++) {
+            StepVerifier.create(shortWait.protect(PROVIDER, Mono.error(status(500))))
+                    .expectError().verify();
+        }
+        assertEquals(CircuitBreaker.State.OPEN, shortWait.stateOf(PROVIDER));
+        assertFalse(shortWait.callable(PROVIDER), "OPEN 的候选要跳过 —— 跳过的理由是不白烧重试预算");
+
+        // 等待期一过，automaticTransitionFromOpenToHalfOpenEnabled 会把它推到 HALF_OPEN
+        long deadline = System.currentTimeMillis() + 2_000;
+        while (shortWait.stateOf(PROVIDER) == CircuitBreaker.State.OPEN
+                && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        assertEquals(CircuitBreaker.State.HALF_OPEN, shortWait.stateOf(PROVIDER));
+        assertTrue(shortWait.callable(PROVIDER), "半开必须放行，否则永远回不到 CLOSED");
+    }
+
+    // --- 重试：次数与异常传递 ---
     /**
      * 重试耗尽后必须抛出<b>原始异常</b>，而不是 resilience4j 的
      * {@code MaxRetriesExceededException}。

@@ -28,7 +28,10 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -56,6 +59,12 @@ import java.util.concurrent.atomic.AtomicReference;
  *      在此之前，上游报错 / 熔断 / 连不上的请求会**白吃掉一整笔预扣**：
  *      一次都没调通，配额却按预扣额扣掉了。平时看不出来，
  *      但因为熔断本身就是"连续失败"触发的，F1 会让这条泄漏在故障期集中爆发。
+ *   E. 一次逻辑请求只预扣一次，但**每一家候选的尝试都要各自结算**（F2）——
+ *      故障转移意味着一次请求可能真的打给了 2 家上游（都计费），
+ *      而预扣只发生在那一次。所以转移路径上的失败尝试必须把**已知用量**
+ *      累加进 spentTokens，否则"花了 N 次的钱、只结算了 1 次"。
+ *      关联的已知取舍：故障期用户实际消耗可能超过配额上限（预扣是按单次算的）——
+ *      见 docs/step-20 的已知边界，方向与 F1 一致（宁可少扣、不可多扣）。
  */
 @Service
 public class ChatPipeline {
@@ -187,15 +196,14 @@ public class ChatPipeline {
 
     private Mono<ChatResponse> dispatch(String apiKey, ChatRequest request, String question,
                                          ModelTier tier, long start, String traceId, long reserved) {
-        ProviderAdapter adapter = providers.forModel(tier.model());
         long begin = System.currentTimeMillis();
-        // 本次请求实际消耗的总 token，可能来自**两次**上游调用（级联升级）。
-        // 用 AtomicLong 在这里汇合两条路径的用量，正好是配额结算需要的口径：
+        // 本次请求实际消耗的总 token，可能来自**多次**上游调用（重试、故障转移、级联升级）。
+        // 用 AtomicLong 在这里汇合所有路径的用量，正好是配额结算需要的口径：
         // 不变量 C 说"两次调用就有两份费用"，那就该有两份 token 计入配额 ——
         // 账本与配额两个口径必须一致，否则对不上账时不知道信哪个。
         AtomicLong spentTokens = new AtomicLong(0);
 
-        return callUpstream(adapter, tier.model(), request)
+        return callWithFailover(tier.model(), request)
                 .flatMap(response -> {
                     // F0：先判定"上游到底给了什么"，再谈怎么处理。
                     UpstreamOutcome outcome = UpstreamOutcome.of(response.content(), response.finishReason());
@@ -220,11 +228,10 @@ public class ChatPipeline {
                                 System.currentTimeMillis() - start);
 
                         ModelTier stronger = routerService.escalateFrom(tier);
-                        ProviderAdapter strongAdapter = providers.forModel(stronger.model());
-                        // 升级后的这一次同样走重试 + 熔断 —— 用的是**另一家** provider
+                        // 升级后的这一次同样走重试 + 熔断 + 转移 —— 用的是**另一家** provider
                         // 的熔断器（按 provider 名分实例）。这正是 F2 要利用的形状：
                         // 便宜那家的熔断器打开了，不代表升级目标那家也不健康。
-                        return callUpstream(strongAdapter, stronger.model(), request)
+                        return callWithFailover(stronger.model(), request)
                                 .map(upgraded -> new ChatResponse(upgraded.id(), stronger.model(),
                                         upgraded.content(), upgraded.usage(), false,
                                         upgraded.finishReason()));
@@ -290,8 +297,12 @@ public class ChatPipeline {
      * <p>还要注意<b>重试的每一次尝试都会真的花钱</b>。当前实现只为"最终交给客户端的那次"
      * 落账（不变量 C 的账本口径），重试中间那几次的用量没有进账本 ——
      * 见 docs/step-19 的已知边界，这是刻意留的取舍。
+     *
+     * @param attempts 本次允许的总尝试次数（含首次），F2 由故障转移的预算分配决定。
+     *                 调用方不指定时用配置里的 {@code retry.max-attempts}。
      */
-    private Mono<ChatResponse> callUpstream(ProviderAdapter adapter, String model, ChatRequest request) {
+    private Mono<ChatResponse> callUpstream(ProviderAdapter adapter, String model, ChatRequest request,
+                                            int attempts) {
         // ★ Mono.defer 不是多余的包装，它是"重试 = 真的再发一次请求"这句承诺的实现。
         // adapter.chat() 返回的是一条**冷** Publisher，每次订阅才会真正出网；
         // 但"冷"是当前 OpenAiAdapter 的实现细节，不是 ProviderAdapter 接口的契约。
@@ -305,13 +316,217 @@ public class ChatPipeline {
                     }
                     return resp;
                 });
-        return resilience.protect(adapter.name(), attempt)
-                .onErrorResume(UpstreamEmptyResponseException.class, e -> Mono.just(e.response()));
+        // ★ 注意这里**没有**把 UpstreamEmptyResponseException 还原成响应 ——
+        // F1 时代还原放在这一层，F2 必须把它挪到整条候选链的末端（见 terminal）。
+        // 理由：还原 = "放弃这次请求、如实把上游说的原因交给客户端"，
+        // 而"放弃"是一个**跨候选**的决定 —— 在这家被还原成正常响应之后，
+        // 外层拿到的就是一个成功值，再没有机会去问下一家。
+        // 空正文恰恰是最该换一家试试的失败（模型侧问题，不是链路问题），
+        // 所以判定必须推迟到"确认没有下一个候选"的那一刻。
+        return resilience.protect(adapter.name(), attempt, attempts);
+    }
+
+    /**
+     * 整条候选链的终点：把"不值得继续转移"的错误按最终形态交出去。
+     *
+     * <p>这里是 F0 的透传与 F2 的转移接壤的地方，顺序不能反：
+     * <b>先穷尽转移，再还原响应</b>。
+     * 反过来（在单次调用内部就还原）会让空正文变成一个成功值，
+     * 外层再没有机会问下一家 —— 一个"换个部署就能拿到正常答案"的请求
+     * 于是被当成"上游明确说了它答不出"直接交付给客户端。
+     */
+    private static Mono<ChatResponse> terminal(Throwable e) {
+        if (e instanceof UpstreamEmptyResponseException empty) {
+            // 重试与转移都试过了，上游仍然只给出空正文 —— 这时必须把那份**原始响应**
+            // 交还给上层，而不是 502。少了这一步，客户端会从
+            // "200 + finish_reason=length + 空正文"退化成"网关坏了"，
+            // 那正是 F0 修掉的错误的镜像版本。
+            return Mono.just(empty.response());
+        }
+        return Mono.error(e);
+    }
+
+    // ---------------------------------------------------------------- F2 故障转移
+
+    /**
+     * 在模型的候选链上做故障转移，直到拿到一个响应（F2）。
+     *
+     * <h3>与 F1 的分工</h3>
+     * F1 的问题域是"<b>同一家</b>上游：再试一次还是直接放弃"；
+     * F2 的问题域是"<b>换一家</b>问：这家不行的时候，候选链上还有谁"。
+     * 两者是同一个失败的两种处置方式，所以共用一套错误分类（
+     * {@code failoverable ⊇ retryable}），但边界完全分开：
+     * F1 在 {@link UpstreamResilience} 里面，F2 在它外面（本方法）。
+     *
+     * <h3>为什么预算是"扣减式"而不是"事后统计"</h3>
+     * 每次尝试之前先把这家要用的次数从总预算里扣掉，扣多少按<b>能用的最多次数</b>算
+     * （{@code min(attemptsPerCall, 剩余预算)}），而不是等它真的失败了几次再补扣。
+     * 因为重试算子内部的计数对外不可见 —— 想知道"这次实际用了几次"就得去问它，
+     * 而那意味着把 resilience4j 的内部状态泄漏到编排层。
+     * 扣减法宁可少给一次机会（链首之外通常只分到 1 次），换一个可以静态算出的上限：
+     * <b>任何一次请求的上游调用次数都不会超过 {@code max-total-attempts}</b>，
+     * 无论链路怎么坏。故障期的账单能算出来，比多给备选一次重试重要得多。
+     */
+    private Mono<ChatResponse> callWithFailover(String model, ChatRequest request) {
+        List<ProviderAdapter> chain = providers.candidatesFor(model);
+        int limit = failoverLimit(chain);
+        AtomicInteger budget = new AtomicInteger(totalAttemptBudget());
+        return attemptChain(chain, limit, 0, budget, model, request);
+    }
+
+    private Mono<ChatResponse> attemptChain(List<ProviderAdapter> chain, int limit, int idx,
+                                            AtomicInteger budget, String model, ChatRequest request) {
+        int i = nextCallable(chain, idx, limit, model);
+        if (i < 0) {
+            return Mono.error(UpstreamCircuitOpenException.allCandidatesUnavailable(
+                    model, namesOf(chain, limit)));
+        }
+        ProviderAdapter adapter = chain.get(i);
+        int attempts = allocate(budget);
+        // 预算是否已经在这次分配后用尽 —— 先算好，错误处理里只看这个布尔量。
+        boolean budgetSpent = budget.get() <= 0;
+
+        // 转移决策全部放在 onErrorResume 里（错误发生时）而不是装配期：
+        // ① 装配期去挑"下一个候选"会在明明不打算转移的情况下也去查一遍熔断状态，
+        //    顺手把 circuit.rejected 记到那些根本没轮到它上场的 provider 头上；
+        // ② 挑不到下一个候选时应当把**原始错误**上抛，而不是换成一个
+        //    "全部不可用"的新错误 —— 后者会把"上游真的报了 500"这个事实抹掉。
+        return callUpstream(adapter, model, request, attempts)
+                .onErrorResume(e -> {
+                    if (budgetSpent) {
+                        return terminal(e);
+                    }
+                    if (!UpstreamResilience.failoverable(e)) {
+                        // 确定性错误（4xx / 配额 / 参数非法）：换一家会拿到一模一样的错误，
+                        // 转移只是把同一份失败再买一次。直接上抛，让错误如实到达客户端。
+                        return terminal(e);
+                    }
+                    int next = nextCallable(chain, i + 1, limit, model);
+                    if (next < 0) {
+                        return terminal(e);
+                    }
+                    ProviderAdapter to = chain.get(next);
+                    metrics.onFailover(adapter.name(), to.name());
+                    log.warn("failing over [model={} from={} to={}]: {}",
+                            model, adapter.name(), to.name(), e.toString());
+                    return attemptChain(chain, limit, next, budget, model, request);
+                });
+    }
+
+    /**
+     * 流式版的候选链转移（F2）。
+     *
+     * <h3>为什么 {@code upstreamProduced} 必须由调用方传进来、而不是每条流各自新建</h3>
+     * 这是 F2 最容易写错、而且错了以后<b>看起来一切正常</b>的一处。
+     * F1 里这个标记的生命周期是"一次 {@code protectStream} 调用"，因为那时候候选只有一家。
+     * 到了 F2，如果每次换 provider 都新建一个标记，就会变成：
+     * <pre>
+     *   a 吐了 3 个正文分片 → 报错 → 新标记是 false → "闸门是开的" → 换 b 重放一遍
+     * </pre>
+     * 客户端于是收到<b>两段拼接的答案</b>，而服务端日志里只有一条漂亮的
+     * "failing over a→b、最终成功"。F1 把重试的重复推送防住了，F2 如果
+     * 各建各的标记就会从故障转移这条新路径上把它放回来 ——
+     * 所以这个 AtomicBoolean 必须<b>跨整个请求</b>共用，包括级联升级那一段。
+     */
+    private Flux<StreamChunk> streamWithFailover(String model, ChatRequest request,
+                                                 AtomicBoolean upstreamProduced) {
+        List<ProviderAdapter> chain = providers.candidatesFor(model);
+        int limit = failoverLimit(chain);
+        AtomicInteger budget = new AtomicInteger(totalAttemptBudget());
+        return attemptStreamChain(chain, limit, 0, budget, model, request, upstreamProduced);
+    }
+
+    private Flux<StreamChunk> attemptStreamChain(List<ProviderAdapter> chain, int limit, int idx,
+                                                 AtomicInteger budget, String model,
+                                                 ChatRequest request, AtomicBoolean upstreamProduced) {
+        int i = nextCallable(chain, idx, limit, model);
+        if (i < 0) {
+            return Flux.error(UpstreamCircuitOpenException.allCandidatesUnavailable(
+                    model, namesOf(chain, limit)));
+        }
+        ProviderAdapter adapter = chain.get(i);
+        int attempts = allocate(budget);
+        boolean budgetSpent = budget.get() <= 0;
+        Flux<StreamChunk> attempt = resilience.protectStream(adapter.name(),
+                // Flux.defer 的理由同 callUpstream：把"每次重试/转移都重新发起一次
+                // 流式调用"写成代码里的承诺，而不是依赖适配器的"冷 Publisher"这个实现细节。
+                Flux.defer(() -> adapter.chatStream(model, request)),
+                upstreamProduced, attempts);
+        return attempt.onErrorResume(e -> {
+            // ★ 闸门：只要有任何一帧到达过客户端，就绝不许换 provider。
+            // 判断依据用 upstreamProduced（任何帧都算）而不是 emitted（只有正文帧算）：
+            // 转移比重试更"重"（换的是另一家的模型），只要有过任何输出，
+            // 重放都会让客户端看到两段不同来源的内容，宁可不救。
+            if (upstreamProduced.get() || budgetSpent) {
+                return Flux.error(e);
+            }
+            if (!UpstreamResilience.failoverable(e)) {
+                return Flux.error(e);
+            }
+            int next = nextCallable(chain, i + 1, limit, model);
+            if (next < 0) {
+                return Flux.error(e);
+            }
+            ProviderAdapter to = chain.get(next);
+            metrics.onFailover(adapter.name(), to.name());
+            log.warn("failing over stream [model={} from={} to={}]: {}",
+                    model, adapter.name(), to.name(), e.toString());
+            return attemptStreamChain(chain, limit, next, budget, model, request, upstreamProduced);
+        });
+    }
+
+    /**
+     * 返回 idx 起第一个"值得调用"的候选下标；顺手把跳过的那些记进指标与日志。
+     *
+     * <p>跳过熔断打开的候选而不是"让它自己抛错再转移"，是为了<b>不浪费预算</b>：
+     * 一次会被熔断器瞬间拒绝的调用不会真的出网，但仍然要按分配额扣掉重试预算，
+     * 于是备选只剩 1 次机会。主力链路长时间不可用时，那意味着**每一个请求**
+     * 都会被削掉重试能力 —— 一个由"白扣预算"引起的、静默的体验退化。
+     */
+    private int nextCallable(List<ProviderAdapter> chain, int from, int limit, String model) {
+        for (int i = Math.max(0, from); i < limit; i++) {
+            ProviderAdapter adapter = chain.get(i);
+            if (resilience.callable(adapter.name())) {
+                return i;
+            }
+            metrics.onCircuitRejected(adapter.name());
+            log.warn("skipping provider whose circuit is open [model={} provider={}]", model,
+                    adapter.name());
+        }
+        return -1;
+    }
+
+    private int failoverLimit(List<ProviderAdapter> chain) {
+        var fo = properties.getResilience().getFailover();
+        if (!fo.isEnabled()) {
+            return 1;
+        }
+        return Math.max(1, Math.min(chain.size(), fo.getMaxProviders()));
+    }
+
+    private int totalAttemptBudget() {
+        var fo = properties.getResilience().getFailover();
+        return fo.isEnabled() ? Math.max(1, fo.getMaxTotalAttempts()) : Integer.MAX_VALUE;
+    }
+
+    /** 从总预算里扣掉"这家最多会用掉几次"，返回分给它的次数上限。 */
+    private int allocate(AtomicInteger budget) {
+        int perCall = resilience.attemptsPerCall();
+        int granted = Math.min(perCall, Math.max(1, budget.get()));
+        budget.addAndGet(-granted);
+        return granted;
+    }
+
+    private static List<String> namesOf(List<ProviderAdapter> chain, int limit) {
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < Math.min(limit, chain.size()); i++) {
+            names.add(chain.get(i).name());
+        }
+        return names;
     }
 
     private Flux<StreamChunk> streamDispatch(String apiKey, ChatRequest request, String question,
                                               ModelTier tier, String traceId, long reserved) {
-        ProviderAdapter cheap = providers.forModel(tier.model());
         AtomicBoolean emitted = new AtomicBoolean(false);
         // 级联升级后实际服务的是更强的模型，账本与响应分片都必须记真实模型名，
         // 否则会出现"按便宜模型计价"的归因错误、以及客户端看到错的模型。
@@ -325,21 +540,19 @@ public class ChatPipeline {
         long start = System.currentTimeMillis();
         // 待结算的真实用量。-1 表示"还没走到流结束"，此时不该结算。
         AtomicLong settleAmount = new AtomicLong(-1);
-        // F1：上游是否**真的**产出过分片。一个标记服务两个判断，两者是同一个事实：
+        // F1：上游是否**真的**产出过分片。一个标记服务三个判断，三者是同一个事实：
         //   ① 重试闸门 —— 一个分片都没产出时才允许重试（否则会重复推送内容）
-        //   ② 失败时的配额口径 —— 产出过就说明确实花了钱，不能退预扣
+        //   ② 故障转移闸门（F2）—— 同理，但边界更严：**跨 provider 共用一个标记**
+        //   ③ 失败时的配额口径 —— 产出过就说明确实花了钱，不能退预扣
         // 交给 UpstreamResilience 写入：它把标记挂在重试边界**之外**，
         // 因此被重试丢弃的那次尝试产出的分片不会被算进来。
         AtomicBoolean upstreamProduced = new AtomicBoolean(false);
 
-        Flux<StreamChunk> primary = resilience.protectStream(cheap.name(),
-                        // Flux.defer 的理由同 callUpstream：把"每次重试都重新发起一次
-                        // 流式调用"写成代码里的承诺，而不是依赖适配器的"冷 Publisher"这个实现细节。
-                        Flux.defer(() -> cheap.chatStream(tier.model(), request)), upstreamProduced)
+        Flux<StreamChunk> primary = streamWithFailover(tier.model(), request, upstreamProduced)
                 .doOnNext(chunk -> collect(chunk, emitted, collected, upstreamUsage, finishReason));
 
         Flux<StreamChunk> body = primary
-                // 已输出内容后不再切换模型，避免用户看到两段拼接的答案
+                // 已输出内容后不再切换模型或 provider，避免用户看到两段拼接的答案
                 .onErrorResume(e -> emitted.get()
                         ? Flux.<StreamChunk>error(e)
                         : Flux.defer(() -> {
@@ -349,13 +562,10 @@ public class ChatPipeline {
                             // 换了模型，上一次调用留下的 finish_reason 必须清掉：
                             // 那是"便宜模型为什么被换掉"的原因，不是最终答案的原因。
                             finishReason.set(null);
-                            ProviderAdapter strong = providers.forModel(stronger.model());
-                            // 升级后的流同样走重试 + 熔断，用的是那家 provider 自己的熔断器。
+                            // 升级后的流同样走重试 + 熔断 + 转移，用那家 provider 自己的熔断器。
                             // 复用同一个 upstreamProduced：便宜那家一个分片都没给出来过，
                             // 所以闸门在这里仍然是开的 —— 这正是我们还能升级的前提。
-                            return resilience.protectStream(strong.name(),
-                                            Flux.defer(() -> strong.chatStream(stronger.model(), request)),
-                                            upstreamProduced)
+                            return streamWithFailover(stronger.model(), request, upstreamProduced)
                                     .doOnNext(chunk -> collect(chunk, emitted, collected,
                                             upstreamUsage, finishReason));
                         }))

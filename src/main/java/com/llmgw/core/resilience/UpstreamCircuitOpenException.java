@@ -1,5 +1,7 @@
 package com.llmgw.core.resilience;
 
+import java.util.List;
+
 /**
  * 熔断器处于打开状态，这次请求<b>根本没有发出去</b>（F1）。
  *
@@ -28,9 +30,33 @@ public class UpstreamCircuitOpenException extends RuntimeException {
     private final String provider;
 
     public UpstreamCircuitOpenException(String provider, Throwable cause) {
-        super("circuit breaker is open for provider " + provider
+        this(provider, "circuit breaker is open for provider " + provider
                 + "; upstream call rejected", cause);
+    }
+
+    private UpstreamCircuitOpenException(String provider, String message, Throwable cause) {
+        super(message, cause);
         this.provider = provider;
+    }
+
+    /**
+     * 整个候选链都不健康：<b>一次上游调用都没发出去</b>（F2）。
+     *
+     * <p>为什么用同一个异常类型而不是新开一个：对客户端来说这两件事的应对完全一样 ——
+     * "网关主动不替你问了，退避再来"，都是 503 + {@code circuit_open}。
+     * 多一个类型就要在状态码映射、错误类型字符串、指标三处各加一条分支，
+     * 而那个分支永远只有一种走法。
+     *
+     * <p>{@link #provider()} 在这里返回<b>逗号分隔的候选名单</b>而不是单个名字。
+     * 这稍微放宽了字段语义，但换来的信息量是对的：客户端与运维最需要知道的是
+     * "哪些链路一起黑了"，而这正是故障归因的第一步。
+     */
+    public static UpstreamCircuitOpenException allCandidatesUnavailable(String model,
+                                                                        List<String> providers) {
+        return new UpstreamCircuitOpenException(
+                String.join(",", providers),
+                "every provider serving model " + model + " is unavailable (circuit open): "
+                        + providers + "; no upstream call attempted", null);
     }
 
     public String provider() {

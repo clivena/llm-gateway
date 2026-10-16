@@ -48,6 +48,14 @@
         timeouts → CircuitBreaker → Retry → 真实上游调用
         · 熔断在内、重试在外 —— 熔断要看到每一次尝试，否则失败率被重试稀释
         · 熔断打开 → 503 + 不再发请求（这是它存在的唯一理由）
+
+  故障转移（F2，包在上面整条链**之外**，按"同模型的候选链"逐个尝试）：
+        [provider-a 的 超时→熔断→重试] → 失败且可转移 → [provider-b 的同一条链] → …
+        · 候选链顺序 = 配置声明顺序 = 优先级
+        · 转移谓词 ⊇ 重试谓词，多出来的是"熔断打开"（那家不问了，去问下一家）
+        · 请求级总预算（默认 4 次），把 maxAttempts × 候选家数 这个乘法关住
+        · 熔断打开的候选**直接跳过**（不白扣预算）；HALF_OPEN 必须放行（否则永不自愈）
+        · 流式：出过任何一帧就不再换家（标记必须跨 provider 共享）
 ```
 
 **模块划分**
@@ -59,8 +67,10 @@ src/main/java/com/llmgw/
 ├── core/
 │   ├── pipeline/        # ChatPipeline：一次请求的完整编排
 │   ├── protocol/        # ProviderAdapter 抽象 + OpenAiAdapter 实现
+│   │                    # ProviderRegistry：model → **候选链**（F2，顺序即优先级）
 │   ├── router/          # RouterService / RoutingPolicy / ModelTier 分级路由
 │   ├── resilience/      # UpstreamResilience：按 provider 的重试 + 熔断（F1）
+│   │                    # 转移谓词 failoverable = retryable ∪ {熔断打开}（F2）
 │   ├── cache/           # SemanticCacheService + Redis 向量检索实现
 │   ├── quota/           # QuotaService：Redis + Lua 原子扣减
 │   └── cost/            # CostLedgerService（sink 可切）+ Repository（R2DBC）
@@ -206,7 +216,7 @@ python scripts/run-gateway-smoke.py
 | GET | `/admin/ledger/recent?limit=` | 账本明细（limit 收口 1~200，避免被当全表导出用） |
 | GET | `/admin/ledger/summary` | 账本按租户汇总（对账口径） |
 | GET | `/admin/quota/{apiKey}` | 指定租户当前周期的配额用量 |
-| GET | `/admin/circuit` | 各 provider 的重试 / 熔断状态与失败率（F1） |
+| GET | `/admin/circuit` | 各 provider 的重试 / 熔断状态与失败率（F1；F2 之后也是"为什么转移了"的第一诊断入口） |
 | GET | `/dashboard` | 可视化控制台（同源托管） |
 | GET | `/actuator/prometheus` | Prometheus 指标（含 `llmgw_cache_hit` 等自定义指标） |
 
@@ -219,7 +229,7 @@ python scripts/run-gateway-smoke.py
 | 400 | 请求不合法——`messages` 为空、`model` 不在服务范围（`error.type = invalid_request_error`） |
 | 429 | 配额超额（`error.type = rate_limit_exceeded`） |
 | 502 | 上游/适配层异常：连不上上游、上游返回非 2xx、上游报错、空响应体（`error.type = upstream_error`） |
-| 503 | **熔断器打开**——请求根本没发给上游（`error.type = circuit_open`，F1） |
+| 503 | **熔断器打开**——请求根本没发给上游。F2 之后也包括"整条候选链都熔断"（`error.type = circuit_open`，F1） |
 | 500 | 其他内部错误 |
 
 > 早期实现把所有错误都写成 HTTP 200 + 响应体里的 `error` 字段。问题不在于"不够规范"：
@@ -390,13 +400,62 @@ python scripts/run-gateway-smoke.py
 - **"桩请求数 4 → 4 未变"** —— 熔断状态显示 OPEN、`circuit.rejected` 涨了，
   都不等于上游真的被放过了。这正是熔断存在的唯一理由，也是唯一能证明它的方式。
 
+### F2 验证（跨 provider 故障转移）
+
+`check-failover.py` —— **13/13 PASS**。分四段跑（四次启动服务），因为四类问题需要四种环境：
+**A 段**打真实 DeepSeek **且**候选链里塞一个不可达部署 ——
+只有真实上游能回答"转移到第二家之后拿到的是不是真答案"；
+A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来量出"顺序即优先级"的代价。
+**B 段**两个本地桩（一家可控失败、一家永远正常并计数）—— 精确计数只能由能计数的上游给出。
+**C 段**同样的桩 + 调小的熔断阈值 —— 熔断状态活在进程里、无法重置，
+要观察"打开之后"就必须用一个专门为它配的环境。
+
+| A 段（真实上游） | 结果 |
+|---|---|
+| 链尾坏候选**零代价**：[真实, 不可达] | HTTP=200 正文 45 字 **转移 0 次** |
+| `/admin/circuit` 列出两家候选 | `providers=['deepseek', 'provider-dead']` |
+| 链首不可达 → **透明转移**：[不可达, 真实] | HTTP=200 正文 57 字 **转移 1 次 retry+2 耗时 4782ms** |
+
+> 同样两家候选，只换顺序：**代价从"零"变成"约 5 秒"** —— 链首要先把 3 次重试预算烧完
+> 才轮到备选，而这段开销要等熔断攒够样本才被接管。A1 还顺手守住了"候选链不会被遍历/探测"：
+> 若实现是"先把候选都探一遍再挑"，链尾多一家坏的也会让每个请求都变慢。
+
+| B 段（两个桩） | 结果 |
+|---|---|
+| 覆盖生效 + **正常路径不转移** | 桩A=1 桩B=0 |
+| **转移真的换了另一家** | 桩A=**3** 桩B=**1**，failover +1 / retry(A) +2，正文来自桩B |
+| 跨 provider **总预算**生效 | HTTP 502 + `upstream_error`，上游总调用 **4/4**（无上限则为 6） |
+| 确定性 4xx **不转移** | 桩A=1 桩B=**0**，HTTP 502 |
+| 流式首片前转移，**正文不重复** | 正文='桩B的答案流式后半段' 桩A stream=3 桩B stream=1 |
+| **首帧后不转移**（闸门） | 客户端收到'首帧已送达'，桩B stream=**0** |
+| failover 指标带**方向**标签 | `from=a,to=b`=3.0 · `from=b,to=a`=0.0 |
+
+| C 段（熔断后） | 结果 |
+|---|---|
+| 失败把 A 的熔断器打开 | HTTP=200（B 兜住）`state=OPEN` |
+| OPEN 的候选**被跳过** | 桩A **3→3**（增量为 0）桩B 1→2 |
+| 全候选不可用 → 快速失败 | HTTP **503** + `circuit_open`，耗时 **32ms**，两桩计数均不变 |
+
+三条只有真机能给的证据：
+
+- **"桩A=3 而不是 1"** —— 证明"重试在内、转移在外"：先在同一家试满再换地方。
+  反过来（一抖动就换家）会表现为桩A只收到 1 次，而备选被无谓消耗。
+- **"桩B=0"**（B5）—— 证明"是否已产出"这个标记**跨 provider 共享**。
+  各建各的标记会让客户端收到"一个首帧 + 一整段答案"的拼接，
+  而服务端日志只有一条漂亮的 `failing over`。为此脚本故意用
+  "声明大于实际写入的 Content-Length"制造 premature close ——
+  那是真机上唯一能做出"首帧已送达 + 报错"这个场景的办法。
+- **"桩A 3→3"**（C2）—— 证明熔断打开的候选是被**跳过**而不是"试一次被拒再换家"。
+  后者每次请求都会白扣一份预算，于是备选只剩 1 次重试机会 —— 一个静默的体验退化。
+
 ---
 
 ## 已知边界（诚实清单）
 
 1. ~~**多供应商未实现**~~ → **已修**：适配器不再单例，由 `ProviderRegistry` 按配置为每家 provider
-   各建一个实例，并建立 `model → adapter` 索引。同名模型先声明者胜（顺序即配置文件顺序）。
-   启动时逐条打印注册结果，配置写错在日志里就能看见。
+   各建一个实例，并建立 `model → 候选链` 索引。同名模型按声明顺序组成故障转移候选链，
+   链首即默认执行者（**顺序即优先级**，F2；旧实现是"先声明者胜、后者被 warn 后丢弃"，
+   那样"同模型多部署"根本表达不出来）。启动时逐条打印注册结果与候选链。
 2. ~~**`RouterService` 模型名硬编码**~~ → **已修**：候选表改为配置项
    `gateway.router.candidates`，并在启动时校验"每个候选都被某个 provider 支持"，
    不一致直接启动失败（把运行时的 502 前移成启动期报错）。`model=auto` 现在可用。
@@ -488,7 +547,41 @@ python scripts/run-gateway-smoke.py
     （这是刻意的 —— 给整条流设超时会拦腰砍断长回答）。首片之后若上游停止发送
     但不断开连接，请求会一直挂着。要覆盖它需要按分片做空闲超时，属另一个改动。
 16. **熔断打开时无法自动恢复被拒请求**：上层不重试、不排队，客户端自己退避。
-    这是 F1 的刻意范围（F2 才会把"转移给下一个 provider"接上）。
+    这是 F1 的刻意范围 —— F2 已把"转移给下一个 provider"接上，
+    但**只在模型配了第二家部署时**才有效（见下方 F2 边界 17）。
+
+### F2 新增的边界
+
+17. **只有一家部署时，F2 的配置块完全无效**。`failover.enabled` 打不打开都一样：
+    候选链只有一个元素，`nextCallable` 永远返回 -1。真机里"a 熔断打开后被跳过"
+    这条只有在链里确实站着第二家时才成立。
+18. **流式空正文不做转移**。流式的空正文只有到流结束才能判定，而那时收尾帧已经下发，
+    再换一家重放会让客户端在"一个 `finish_reason`"之后又看到新正文 ——
+    两段拼接的答案。保持 F0 的 `200 + length` 透传。
+    （**非流式的空正文会触发转移**：它没有被下发过，换个部署重来一次没有副作用。）
+19. **一次请求只预扣一次，但故障期可能真的花掉 N 次的钱** → 配额上限会被小幅突破。
+    方向与 F1 一致：少扣可追、多扣不可逆。
+20. **中间尝试不入账本**（沿用 F1 边界 11）。F1 里这是理论风险，F2 把它变成**必然路径**：
+    一次请求最多 4 次上游调用，账本只记最终那一次成功的。
+    要真修需要"每次尝试单独落账"，已列为 B 批余项。
+21. **4xx 会计入熔断窗口**。Resilience4j 默认把所有异常都算失败，
+    而 400 是客户端问题、不该让下游的熔断器背。应当配 `ignoreException(...)`，尚未做。
+    （真机 B3/C 段用的就是这个特性：用 400 打开 A 的熔断器，而不牵连 B。）
+22. **候选顺序是静态的**：没有按健康度动态排序、没有权重、没有轮询。
+    链首恢复要靠熔断器的 HALF_OPEN 探针（自动半开已开）逐步把流量拿回来。
+23. **候选目标不做预检**：不会先探一下备选再决定，直接尝试。
+24. **链首不可达时每个请求仍要先烧 3 次重试**，直到熔断打开
+    （需要攒够 `minimum-number-of-calls` 次调用）。真机 A2 实测约 **5 秒**。
+    调小 `minimum-number-of-calls` 能更快打开，但会更容易误判 ——
+    这就是为什么 F1 的熔断阈值得先跑够流量再调。
+25. **熔断状态不持久化**：进程重启后全部回到 CLOSED，故障期重启会有一段"重新学一遍"的窗口。
+26. **流中途卡住仍无防护**（沿用 F1 边界 15）：`Flux.timeout` 的作用域只有首元素，
+    首片之后一直不吐字不会触发任何超时 —— **因此也不会触发转移**。
+    F2 没有把它变好，只是让"这个坑会挡住一次本可生效的转移"这件事变得具体。
+27. **同一个请求可能前半段是上游错误、后半段是熔断**：熔断器会在**一次请求中途**翻到 OPEN ——
+    真机 C 段就观察到第 3 个请求里 B 的重试进行到一半就够阈值，
+    第 3 次尝试被当场拒绝，于是那一次请求的失败类型是 `circuit_open` 而不是 `upstream_error`。
+    这是对的（网关真的没发那次请求），但**排查时别把两者当互斥**。
 
 ---
 
@@ -507,6 +600,8 @@ python scripts/run-gateway-smoke.py
 6. **`SynchronousSink` 一次只允许 `next()` 一个元素（F0）**——DeepSeek 的末帧**同时带 `usage` 与 `finish_reason`**，两个分支各发一次就把整条流打成 502（`Cannot emit more than one data`）。而在此之前它一直是好的：普通增量帧没有 usage、用量帧没有 choices，两个分支从未同时命中。**旧写法是靠数据形状的巧合在运行**。修法是 `handle` → `flatMapIterable`。
 7. **`WebClientException` 没被状态码映射覆盖（F1）**——上游任何非 2xx 都曾落到 `500`。`WebClientResponseException` 继承 `NestedRuntimeException`，既不是 `IllegalStateException` 也不是 `IllegalArgumentException`，穿过所有分支掉进最后的兜底。**这个缺陷一直存在**，只是网关从不重试时上游一次 500 就直接穿过去，没人核对过状态码；重试让"重试耗尽"变成必然走到的路径之后，它才被真机断言抓出来。教训：**新的失败路径会把旧代码里从没被认真走过的分支变成主路径。**
 8. **Mockito 的 `anyString()` 不匹配 `null`（F1）**——`ChatPipelineQuotaSettleTest` 里 8 条断言全红，报的却是一个看不懂的 NPE：管线用 `adapter.name()` 做熔断器实例键，而那个 mock 没桩 `name()` → 返回 `null` → `anyString()` 不匹配 → 桩未生效 → 走默认返回 `null`。一个方法返回值参与后续控制流时，漏桩它会以**另一个地方的 NPE** 的形式出现。
+9. **候选链根本存不下来：数据结构先于算法（F2）**——`ProviderRegistry.byModel` 原本是 `Map<String, ProviderAdapter>`，用 `putIfAbsent` + `warn 忽略`，**同模型的第二家 provider 会被丢掉**。配置写对、启动日志也打了、请求也不报错，只是第二家永远用不到。如果先写完转移逻辑再来改这本就不会发现的：**单测会全绿而真机永远不转移**。教训：加"多候选"这类能力时，**先确认承载它的数据结构能表达出来**，再写算法。
+10. **`onErrorResume` 的位置决定了转移能不能生效（F2）**——F1 把"空正文还原成响应"写在 `callUpstream` **内部**（`onErrorResume(UpstreamEmptyResponseException.class, e -> Mono.just(e.response()))`）。到 F2 就出事：**还原成一个成功值之后，外层拿到的就是成功，再没有机会去问下一家** —— "换个部署就能拿到正常答案"的请求被当成"上游明确说了它答不出"直接交付。`emptyAnswerTriggersFailover` 第一次跑就是这样红的（`predicate failed on value: content=, finishReason=length`）。修法是把还原从"单次调用内部"挪到**整条候选链的末端**（`terminal`）：**先穷尽转移，再还原响应**。
 
 ---
 
@@ -531,6 +626,7 @@ python scripts/run-gateway-smoke.py
 | [17](./docs/step-17-token-estimate-and-cache-layers.md) | **估算从"猜"变"算"**：`TokenEstimator` + 缓存拆两级 + MDC 贯通 |
 | [18](./docs/step-18-reasoning-model-failure-semantics.md) | **推理型模型的失败语义**：`finish_reason` 透传 + 配额 reserve-then-settle |
 | [19](./docs/step-19-retry-and-circuit-breaker.md) | **重试与熔断**：Resilience4j 算子嵌套 + 流式重试闸门 + 失败路径的配额结算 |
+| [20](./docs/step-20-cross-provider-failover.md) | **跨 provider 故障转移**：候选链数据结构 + `failoverable` 谓词 + 请求级预算扣减 |
 
 ---
 

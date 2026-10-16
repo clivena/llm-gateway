@@ -69,6 +69,56 @@ class ProviderRegistryTest {
         assertEquals("primary", registry.forModel("shared-model").name());
     }
 
+    // --- F2：同模型的其余声明不再是"被忽略的配置"，而是候选链 ---
+
+    /**
+     * 这是 F2 的数据结构前提：重复声明必须被<b>保留</b>成候选，顺序 = 声明顺序。
+     *
+     * <p>改之前（putIfAbsent + warn 忽略），这个断言写不出来 ——
+     * 第二家 provider 在内存里根本不存在。那种失败特别隐蔽：
+     * 配置写对了、启动日志也打了、请求也不报错，只是第二家永远不会被用到。
+     * 故障转移写完了却"永远不生效"，第一嫌疑人就是这里。
+     */
+    @Test
+    void duplicateModelFormsAFailoverChainInDeclarationOrder() {
+        ProviderRegistry registry = registryOf(
+                provider("primary", "https://a.example/v1", "shared-model"),
+                provider("secondary", "https://b.example/v1", "shared-model"),
+                provider("tertiary", "https://c.example/v1", "shared-model"));
+
+        List<String> chain = registry.candidatesFor("shared-model").stream()
+                .map(ProviderAdapter::name).toList();
+        assertEquals(List.of("primary", "secondary", "tertiary"), chain,
+                "候选链的顺序必须等于配置里的声明顺序 —— 谁优先必须是显式可读的");
+        assertEquals("primary", registry.forModel("shared-model").name(),
+                "forModel 仍然只回答'默认那一家'");
+    }
+
+    /**
+     * 同一家 provider 在自己的 models 里把同一个模型名写两遍 → 去重。
+     *
+     * <p>不去重的话候选链里会出现两个一模一样的候选：故障转移会"换到同一家"再打一次，
+     * 白烧一次调用，而且日志看起来像完成了一次正常的故障转移。
+     */
+    @Test
+    void sameModelDeclaredTwiceByOneProviderIsDeduplicated() {
+        ProviderRegistry registry = registryOf(
+                provider("deepseek", "https://api.deepseek.com/v1",
+                        "deepseek-flash", "deepseek-flash"));
+
+        assertEquals(1, registry.candidatesFor("deepseek-flash").size());
+    }
+
+    /** 单一部署的模型，候选链就只有一家 —— 故障转移在这种模型上不会生效（也不该生效）。 */
+    @Test
+    void singleDeploymentYieldsASingleCandidateChain() {
+        ProviderRegistry registry = registryOf(
+                provider("deepseek", "https://api.deepseek.com/v1", "deepseek-flash"));
+
+        assertEquals(List.of("deepseek"),
+                registry.candidatesFor("deepseek-flash").stream().map(ProviderAdapter::name).toList());
+    }
+
     @Test
     void unknownModelFailsWithRegistryContentInMessage() {
         ProviderRegistry registry = registryOf(

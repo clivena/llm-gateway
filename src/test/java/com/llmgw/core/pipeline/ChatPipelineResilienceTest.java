@@ -93,8 +93,11 @@ class ChatPipelineResilienceTest {
         when(quotaService.settle(anyString(), anyLong(), anyLong())).thenReturn(Mono.just(0L));
         when(cacheService.lookup(anyString(), anyString())).thenReturn(Mono.empty());
         when(cacheService.write(anyString(), anyString(), anyString())).thenReturn(Mono.empty());
-        when(providers.forModel(MODEL)).thenReturn(cheapAdapter);
-        when(providers.forModel(STRONG)).thenReturn(strongAdapter);
+        // F2 起管线走的是 candidatesFor（候选链）而不是 forModel（单值）。
+        // 单个候选写成 singleton 列表：等价于"这个模型只有一家部署"，
+        // 也就是 F1 的部署形态 —— F1 的语义不该因为 F2 引入候选链而改变。
+        when(providers.candidatesFor(MODEL)).thenReturn(List.of(cheapAdapter));
+        when(providers.candidatesFor(STRONG)).thenReturn(List.of(strongAdapter));
         when(cheapAdapter.name()).thenReturn("deepseek");
         when(strongAdapter.name()).thenReturn("deepseek");
         when(routerService.shouldEscalate(any(ModelTier.class), any(), anyBoolean())).thenReturn(false);

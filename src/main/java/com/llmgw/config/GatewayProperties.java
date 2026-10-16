@@ -76,6 +76,7 @@ public class GatewayProperties {
 
         private Retry retry = new Retry();
         private CircuitBreaker circuitBreaker = new CircuitBreaker();
+        private Failover failover = new Failover();
 
         /**
          * 非流式请求的整体超时。
@@ -107,6 +108,8 @@ public class GatewayProperties {
         public void setRetry(Retry retry) { this.retry = retry; }
         public CircuitBreaker getCircuitBreaker() { return circuitBreaker; }
         public void setCircuitBreaker(CircuitBreaker circuitBreaker) { this.circuitBreaker = circuitBreaker; }
+        public Failover getFailover() { return failover; }
+        public void setFailover(Failover failover) { this.failover = failover; }
         public long getTimeoutMillis() { return timeoutMillis; }
         public void setTimeoutMillis(long v) { this.timeoutMillis = v; }
         public long getFirstChunkTimeoutMillis() { return firstChunkTimeoutMillis; }
@@ -182,6 +185,63 @@ public class GatewayProperties {
         public void setWaitDurationInOpenStateMillis(long v) { this.waitDurationInOpenStateMillis = v; }
         public int getPermittedNumberOfCallsInHalfOpenState() { return permittedNumberOfCallsInHalfOpenState; }
         public void setPermittedNumberOfCallsInHalfOpenState(int v) { this.permittedNumberOfCallsInHalfOpenState = v; }
+    }
+
+    /**
+     * 跨 provider 故障转移（F2）。
+     *
+     * <h3>它解决的是"熔断之后怎么办"</h3>
+     * F1 让熔断打开时返回 503 快速失败 —— 诚实地告诉客户端"我现在不替你问了"，
+     * 但这仍然是<b>一次失败</b>。F2 补上后半个答案："不问这家，去问下一家。"
+     * 只有熔断没有转移，一次链路故障就等于整站不可用；只有转移没有熔断，
+     * 转移会在故障期对着一堆坏链路反复冲。
+     *
+     * <h3>为什么必须有两个上限，而不是一个</h3>
+     * 重试次数与候选家数是<b>相乘</b>关系：{@code maxAttempts=3} × 3 家 = 9 次
+     * 真实计费的上游调用。故障期里这个乘法会把账单放大一个量级，
+     * 而"故障期账单爆炸"是最难在事后解释清楚的一类事故。所以：
+     * <ul>
+     *   <li>{@code maxProviders} 限制<b>换几家</b>（宽度）；</li>
+     *   <li>{@code maxTotalAttempts} 限制<b>总共发几次</b>（总量）。</li>
+     * </ul>
+     * 只配其中一个都会留下一个可以无限放大的方向（家数越多、或者每家的
+     * maxAttempts 越大）。两个一起配，最坏情况才有一个能算出来的数。
+     *
+     * <p>总量是<b>请求级</b>而不是 provider 级：预算按候选顺序递减分配，
+     * 第一家拿满，后面的候选只分到剩余额度。这与"先试最信任的那家、
+     * 不行再快速探一下其余的"这个直觉一致 —— 也让上限严格成立。
+     */
+    public static class Failover {
+        /**
+         * 总开关。
+         *
+         * <p>关掉时行为与 F1 完全一致（只用链首、失败即返回），
+         * 是故障期排查"是不是转移把问题放大了"的一键回退开关。
+         */
+        private boolean enabled = true;
+        /**
+         * 最多尝试几家候选（含链首）。默认 2 = "主力 + 1 个备选"。
+         *
+         * <p>默认只给 2 而不是"配置了几家就试几家"：候选链长度是<b>部署拓扑</b>，
+         * 它不该顺便决定故障期的调用次数。想多试几家就显式调大，
+         * 让这个决定是有人做过的。
+         */
+        private int maxProviders = 2;
+        /**
+         * 一次请求内允许发起的<b>上游调用总次数</b>（跨 provider 累计，含首次）。
+         *
+         * <p>默认 4 与 {@code retry.max-attempts: 3} 的关系是刻意算过的：
+         * 链首拿 3 次（首次 + 2 次重试），剩下的 1 次留给备选 ——
+         * 备选只探一次就够回答"是不是整条链路都坏了"，再多探就只是在花钱。
+         */
+        private int maxTotalAttempts = 4;
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean v) { this.enabled = v; }
+        public int getMaxProviders() { return maxProviders; }
+        public void setMaxProviders(int v) { this.maxProviders = v; }
+        public int getMaxTotalAttempts() { return maxTotalAttempts; }
+        public void setMaxTotalAttempts(int v) { this.maxTotalAttempts = v; }
     }
 
     /**

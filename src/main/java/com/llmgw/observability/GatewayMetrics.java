@@ -29,8 +29,20 @@ import java.util.function.Supplier;
  *   llmgw.upstream.retry            上游调用被放弃并重试  ← F1 新增，tag: provider
  *   llmgw.circuit.open              熔断器是否打开 0/1     ← F1 新增，tag: provider（Gauge）
  *   llmgw.circuit.rejected          因熔断被拦下的请求     ← F1 新增，tag: provider
+ *   llmgw.upstream.failover         故障转移到下一个 provider ← F2 新增，tag: from / to
  *   llmgw.request.latency           延迟直方图，tag: model / stream
  * </pre>
+ *
+ * <h3>为什么 failover 用 from/to 两个标签而不是一个"当前 provider"标签（F2）</h3>
+ * "转移到备选"这句话本身不构成信号 —— 它必须回答<b>是谁转移到了谁</b>。
+ * 单看总数，同样是"一天 500 次转移"，可能是 A→B（A 挂了，B 在扛，符合预期），
+ * 也可能是 B→A（流量在两个坏链路之间来回踢皮球，说明两家都不稳）。
+ * 前者的处置是"去查 A"，后者是"去查为什么两家都不稳"，完全相反。
+ *
+ * <p>基数：provider 数量是个位到几十，from×to 的组合数最多是这个数的平方，
+ * 对时序库而言完全可控（对比 model × status 那类标签组合更小）。
+ * 真要担心基数的话，正确做法是限流 provider 数量，而不是把 from/to 合成一个标签
+ * 而丢掉归因能力。
  *
  * <h3>为什么 F1 的三个指标都必须带 provider 标签</h3>
  * 熔断与重试的价值全在"哪条链路不健康"这个判断上。把三个 provider 的重试次数
@@ -87,6 +99,8 @@ public class GatewayMetrics {
      */
     private final ConcurrentMap<String, Counter> upstreamRetryByProvider = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Counter> circuitRejectedByProvider = new ConcurrentHashMap<>();
+    /** 键是 "from\u0000to"（用 NUL 而不是 "->" 拼接：provider 名里出现箭头字符时会撞键）。 */
+    private final ConcurrentMap<String, Counter> failoverByPair = new ConcurrentHashMap<>();
 
     public GatewayMetrics(MeterRegistry registry) {
         this.registry = registry;
@@ -160,6 +174,24 @@ public class GatewayMetrics {
         circuitRejectedByProvider
                 .computeIfAbsent(provider, p -> Counter.builder("llmgw.circuit.rejected")
                         .tag("provider", p)
+                        .register(registry))
+                .increment();
+    }
+
+    /**
+     * 一次故障转移：请求从 {@code from} 那家换到了 {@code to} 那家（F2）。
+     *
+     * <p>它记的是"换过去了"这个动作，<b>不代表最后成功</b> ——
+     * 转移过去的那家也可能失败。这不是命名不精确，而是故意的：
+     * "转移了多少次"回答"有多少流量被踢出了首选链路"，
+     * 这正是容量评估与故障归因需要的数字。要算成功率得配合 upstream.outcome 一起看。
+     */
+    public void onFailover(String from, String to) {
+        String key = from + "\u0000" + to;
+        failoverByPair
+                .computeIfAbsent(key, k -> Counter.builder("llmgw.upstream.failover")
+                        .tag("from", from)
+                        .tag("to", to)
                         .register(registry))
                 .increment();
     }

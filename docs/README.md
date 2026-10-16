@@ -20,8 +20,9 @@
 | 17 | **估算从"猜"变"算"** + 缓存拆两级 + MDC 贯通 | [step-17](./step-17-token-estimate-and-cache-layers.md) |
 | 18 | 推理型模型的失败语义 + 配额 reserve-then-settle（F0） | [step-18](./step-18-reasoning-model-failure-semantics.md) |
 | 19 | **重试与熔断**：Resilience4j 算子嵌套 + 流式重试闸门 + 失败路径配额结算（F1） | [step-19](./step-19-retry-and-circuit-breaker.md) |
+| 20 | **跨 provider 故障转移**：候选链 + 请求级预算 + 流式闸门跨 provider 共享（F2） | [step-20](./step-20-cross-provider-failover.md) |
 
-> 16~19 均已成篇。14 号步骤当时未单独成篇，内容并入 [step-15](./step-15-review-fixes.md)。
+> 16~20 均已成篇。14 号步骤当时未单独成篇，内容并入 [step-15](./step-15-review-fixes.md)。
 > 当前状态与已知边界见 [README 的已知边界](../README.md#已知边界诚实清单)。
 
 ---
@@ -44,6 +45,9 @@
 | [step-16](./step-16-reactive-multi-provider.md) | 响应式化是"后续重试与熔断的**硬前提**"（当时重试熔断尚未实现） | **前提已兑现**：`timeout` / 重试 / 熔断全部落在 Reactor 算子上（见 [step-19](./step-19-retry-and-circuit-breaker.md)） |
 | [step-15](./step-15-review-fixes.md) | 错误码映射：上游/适配层异常 → 502 | **当时只覆盖到 `IllegalStateException`**。`WebClientResponseException` 继承 `NestedRuntimeException`，于是**上游任何非 2xx 实际都落到 500** —— 这个缺陷一直到 F1 靠真机断言才被抓出来（见 [step-19](./step-19-retry-and-circuit-breaker.md)） |
 | [step-03](./step-03-chat-pipeline.md) / [step-18](./step-18-reasoning-model-failure-semantics.md) | 配额结算只覆盖**成功**路径 | **已变更（不变量 D）**：失败路径也结算，且"确定没到达上游"（熔断 / 连不上）时全额退还预扣（见 [step-19](./step-19-retry-and-circuit-breaker.md)） |
+| [step-16](./step-16-reactive-multi-provider.md) | 同名模型"**先声明者胜**，后来者被忽略并 warn" | **已推翻**：改成候选链（顺序仍是优先级，但后来者不再被丢弃）。原实现下"同模型多部署"这个配置**根本表达不出来**，F2 的故障转移无从谈起（见 [step-20](./step-20-cross-provider-failover.md)） |
+| [step-16](./step-16-reactive-multi-provider.md) | `forModel(model)` 是唯一的模型→适配器查找入口 | **已扩展**：新增 `candidatesFor(model)` 返回候选链，`forModel` 变成取链首。需要"只想挑一家"的地方语义不变（见 [step-20](./step-20-cross-provider-failover.md)） |
+| [step-19](./step-19-retry-and-circuit-breaker.md) | 空正文的重试耗尽后，在 `callUpstream` 内部还原成原始响应 | **位置已挪走**：还原必须在整条候选链的**末端**（`terminal`）。在单次调用内部还原等于把空正文变成一个成功值，外层再没机会问下一家——F2 的 `emptyAnswerTriggersFailover` 第一次跑就是这样红的（见 [step-20](./step-20-cross-provider-failover.md)） |
 
 ---
 

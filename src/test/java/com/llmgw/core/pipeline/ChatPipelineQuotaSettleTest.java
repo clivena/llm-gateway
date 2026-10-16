@@ -35,6 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -95,14 +96,20 @@ class ChatPipelineQuotaSettleTest {
         when(quotaService.tryConsume(anyString(), anyLong())).thenReturn(Mono.just(true));
         when(quotaService.settle(anyString(), anyLong(), anyLong())).thenReturn(Mono.just(0L));
         when(cacheService.write(anyString(), anyString(), anyString())).thenReturn(Mono.empty());
-        when(providers.forModel(MODEL)).thenReturn(adapter);
+        when(providers.candidatesFor(MODEL)).thenReturn(List.of(adapter));
         // ★ 必须桩上 name()：管线用它做**熔断器的实例键**，返回 null 的话
         // resilience.protect(...) 是收不到任何调用的 —— 而那种失败的表现是
         // "配额断言全红 + 一个看不懂的 NPE"，排查方向会完全跑偏。
         // 真实实现里这个名字来自 provider 配置，永远非空。
         when(adapter.name()).thenReturn("deepseek");
+        // F2：候选可用性与预算分配都要桩上。Mockito 对 boolean 的默认返回值是 false，
+        // 而 callable() 返回 false 的语义是"这家熔断打开、跳过" ——
+        // 不桩的话每个用例都会变成"全部候选不可用"，
+        // 报出来的却是一堆和配额无关的错，方向会跑偏到故障转移上去。
+        when(resilience.callable(anyString())).thenReturn(true);
+        when(resilience.attemptsPerCall()).thenReturn(3);
         // 直通：把传进来的那条 Mono 原样返回
-        when(resilience.protect(anyString(), any())).thenAnswer(inv -> inv.getArgument(1));
+        when(resilience.protect(anyString(), any(), anyInt())).thenAnswer(inv -> inv.getArgument(1));
         // 显式指定模型 → 不让路由自作主张升级（否则会静默产生贵模型账单）
         when(routerService.shouldEscalate(any(ModelTier.class), any(), anyBoolean())).thenReturn(false);
     }

@@ -92,6 +92,41 @@ public class UpstreamResilience {
      */
     private static final Predicate<Throwable> RETRYABLE = UpstreamResilience::retryable;
 
+    /**
+     * 非流式：把一次上游调用包上超时 → 熔断 → 重试，并把"熔断打开"翻译成本项目的异常类型。
+     *
+     * <p>调用方若要把"空正文"也纳入重试，必须在传进来之前先把它转成
+     * {@link UpstreamEmptyResponseException}（见 ChatPipeline），因为重试算子只认错误信号。
+     */
+    public <T> Mono<T> protect(String provider, Mono<T> call) {
+        return protect(provider, call, cfg.getRetry().getMaxAttempts());
+    }
+
+    /**
+     * 同上，但由调用方指定本次的重试次数上限（F2）。
+     *
+     * <h3>为什么需要这个重载</h3>
+     * 故障转移要在<b>多个 provider 之间</b>共享一份调用次数预算。若每家都各拿
+     * 完整的 {@code maxAttempts}，最坏情况是 {@code maxAttempts × 候选家数} 次真实计费调用 ——
+     * 3 × 3 = 9 次。把"这家还剩几次机会"的决策权交给调用方（它才知道整体预算
+     * 和这是第几家），是让上限落在**请求级**而不是**provider 级**的唯一办法。
+     *
+     * <p>参数语义与配置里的 {@code max-attempts} 完全一致：总尝试次数<b>含首次</b>。
+     */
+    public <T> Mono<T> protect(String provider, Mono<T> call, int maxAttempts) {
+        Mono<T> decorated = call.timeout(Duration.ofMillis(cfg.getTimeoutMillis()));
+        if (cfg.getCircuitBreaker().isEnabled()) {
+            decorated = decorated.transformDeferred(CircuitBreakerOperator.of(breakerFor(provider)));
+        }
+        if (cfg.getRetry().isEnabled()) {
+            decorated = decorated.transformDeferred(
+                    RetryOperator.of(newRetry(provider, RETRYABLE, maxAttempts)));
+        }
+        // 翻译放在最外层：重试谓词要拿到原始的 CallNotPermittedException 才能判断
+        // "这个不该重试"，所以它必须在内层就确定下来，不能被提前替换掉。
+        return decorated.onErrorMap(CallNotPermittedException.class, e -> circuitOpen(provider, e));
+    }
+
     private final GatewayProperties properties;
     private final GatewayProperties.Resilience cfg;
     private final GatewayMetrics metrics;
@@ -122,25 +157,6 @@ public class UpstreamResilience {
     }
 
     /**
-     * 非流式：把一次上游调用包上超时 → 熔断 → 重试，并把"熔断打开"翻译成本项目的异常类型。
-     *
-     * <p>调用方若要把"空正文"也纳入重试，必须在传进来之前先把它转成
-     * {@link UpstreamEmptyResponseException}（见 ChatPipeline），因为重试算子只认错误信号。
-     */
-    public <T> Mono<T> protect(String provider, Mono<T> call) {
-        Mono<T> decorated = call.timeout(Duration.ofMillis(cfg.getTimeoutMillis()));
-        if (cfg.getCircuitBreaker().isEnabled()) {
-            decorated = decorated.transformDeferred(CircuitBreakerOperator.of(breakerFor(provider)));
-        }
-        if (cfg.getRetry().isEnabled()) {
-            decorated = decorated.transformDeferred(RetryOperator.of(newRetry(provider, RETRYABLE)));
-        }
-        // 翻译放在最外层：重试谓词要拿到原始的 CallNotPermittedException 才能判断
-        // "这个不该重试"，所以它必须在内层就确定下来，不能被提前替换掉。
-        return decorated.onErrorMap(CallNotPermittedException.class, e -> circuitOpen(provider, e));
-    }
-
-    /**
      * 流式：与非流式同样的嵌套，但重试多一道闸门 —— <b>只有"一个分片都还没吐出去"时才允许重试</b>。
      *
      * <h3>为什么流式必须额外加这道闸门</h3>
@@ -161,6 +177,12 @@ public class UpstreamResilience {
      */
     public <T> Flux<T> protectStream(String provider, Flux<T> call,
                                      AtomicBoolean upstreamProducedSomething) {
+        return protectStream(provider, call, upstreamProducedSomething, cfg.getRetry().getMaxAttempts());
+    }
+
+    /** 同 {@link #protect(String, Mono, int)}，流式版本。 */
+    public <T> Flux<T> protectStream(String provider, Flux<T> call,
+                                     AtomicBoolean upstreamProducedSomething, int maxAttempts) {
         // Flux.timeout(Duration) 的作用域就是**首元素**：后续元素不受它约束。
         // 所以这一行直接就是"首片超时"，不需要自己写计时器 ——
         // 参数语义与算子语义天然对齐，是选它而不是选 Mono 侧 timeout 的原因。
@@ -172,7 +194,8 @@ public class UpstreamResilience {
             // 闸门读的是"下游是否已经收到过分片"。注意上游产出 ≠ 下游收到：
             // 标记挂在重试边界**之外**，被重试丢掉的那次尝试所产出的分片不会留下痕迹。
             Predicate<Throwable> gated = RETRYABLE.and(e -> !upstreamProducedSomething.get());
-            decorated = decorated.transformDeferred(RetryOperator.of(newRetry(provider, gated)));
+            decorated = decorated.transformDeferred(
+                    RetryOperator.of(newRetry(provider, gated, maxAttempts)));
         }
         return decorated
                 // ★ 位置关键：必须在 RetryOperator 之后。
@@ -182,9 +205,31 @@ public class UpstreamResilience {
                 .onErrorMap(CallNotPermittedException.class, e -> circuitOpen(provider, e));
     }
 
+    /**
+     * 一个候选默认能拿到几次尝试（含首次）= 配置的 {@code max-attempts}；重试关掉时是 1。
+     *
+     * <p>F2 的故障转移用它来算"这家该分到多少预算"。
+     */
+    public int attemptsPerCall() {
+        return cfg.getRetry().isEnabled() ? Math.max(1, cfg.getRetry().getMaxAttempts()) : 1;
+    }
+
     /** 某个 provider 的熔断状态。测试与面板用；F2 的故障转移也要靠它挑下一个候选。 */
     public CircuitBreaker.State stateOf(String provider) {
         return breakerFor(provider).getState();
+    }
+
+    /**
+     * 这个 provider 现在值不值得发起调用（F2）。
+     *
+     * <p>只有 OPEN / FORCED_OPEN 算"不值得"。
+     * <b>HALF_OPEN 必须放行</b>：半开状态的定义就是"放几个试探请求看看恢复了没"，
+     * 把它一并跳过，熔断器就永远等不到那几个探针，永远回不到 CLOSED ——
+     * 从一个能自愈的状态变成一个永久黑洞，而且看起来只是"流量都走了备选"。
+     */
+    public boolean callable(String provider) {
+        CircuitBreaker.State state = stateOf(provider);
+        return state != CircuitBreaker.State.OPEN && state != CircuitBreaker.State.FORCED_OPEN;
     }
 
     /** 各 provider 的熔断状态快照，给 /admin/circuit 用。 */
@@ -234,11 +279,14 @@ public class UpstreamResilience {
 
     /**
      * 为单次请求造一个 Retry。谓词由调用方给 —— 流式路径要在基础谓词上再叠一道闸门。
+     *
+     * <p>{@code maxAttempts} 由调用方给（F2）：故障转移要在多个候选之间分摊总预算，
+     * 每个候选拿到的次数是"剩余预算"而不是配置里的固定值。
      */
-    private Retry newRetry(String provider, Predicate<Throwable> predicate) {
+    private Retry newRetry(String provider, Predicate<Throwable> predicate, int maxAttempts) {
         var r = cfg.getRetry();
         RetryConfig config = RetryConfig.custom()
-                .maxAttempts(Math.max(1, r.getMaxAttempts()))
+                .maxAttempts(Math.max(1, maxAttempts))
                 .intervalFunction(IntervalFunction.ofExponentialBackoff(
                         Duration.ofMillis(r.getWaitDurationMillis()),
                         r.getBackoffMultiplier(),
@@ -311,6 +359,48 @@ public class UpstreamResilience {
         //   - IllegalArgumentException：请求本身不合法（messages 为空），重试结果一样。
         //   - 其余 4xx：模型名不存在、参数非法、鉴权失败 —— 全是确定性的。
         return false;
+    }
+
+    /**
+     * 哪些错误值得"换一家 provider 再试"（F2）。
+     *
+     * <h3>它与 {@link #retryable} 的关系是包含，不是相等</h3>
+     * <pre>
+     *   failoverable = retryable ∪ {熔断打开}
+     * </pre>
+     * 两个方向的直觉都要过一遍才成立：
+     * <ul>
+     *   <li><b>能重试的一定能转移</b>：5xx / 429 / 连不上 / 超时 / 空正文 ——
+     *       "同一家再试一次可能好"，那"换一家"就<b>更</b>可能好，没有理由不转移。</li>
+     *   <li><b>熔断打开能转移但不能重试</b>：重试仍然进不去熔断器（它还在开着的窗口里），
+     *       只会空转把重试预算烧光；但<b>换一家</b>是完全不同的一条链路，
+     *       那家好好的就该让它上 —— 这正是熔断与转移必须成对存在的原因：
+     *       熔断负责"不再问这家"，转移负责"那接下来问谁"。
+     *       只有熔断没有转移，一次链路故障就变成整站不可用。</li>
+     *   <li><b>确定性错误两者都不做</b>：400 / 401 / 模型名不存在，
+     *       换一家 provider 会拿到<b>一模一样</b>的错误（网关发出去的请求没变），
+     *       转移只是把同一份失败多买一次。</li>
+     * </ul>
+     *
+     * <p>注意这里刻意<b>不去看异常来自哪家 provider</b>：谓词只回答"这个错误类型
+     * 值不值得换个地方试"，"下一个地方是哪家、还有没有预算"是调用方的事。
+     * 混在一起写，测试就没法单独把判据钉住。
+     */
+    public static boolean failoverable(Throwable e) {
+        if (e == null) {
+            return false;
+        }
+        if (e instanceof UpstreamCircuitOpenException) {
+            // 上游链路被判定为不可用（连 TCP 都没建）。换一家是第一反应。
+            return true;
+        }
+        if (e instanceof CallNotPermittedException) {
+            // 理论上走不到这里：protect 的 onErrorMap 已经把它翻译成
+            // UpstreamCircuitOpenException。留着是为了让谓词对"未翻译"的形态也安全 ——
+            // 谓词是公开 API，别的地方可能直接拿到 resilience4j 的原始异常。
+            return true;
+        }
+        return retryable(e);
     }
 
     private static String describe(Throwable e) {

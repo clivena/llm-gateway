@@ -13,6 +13,7 @@ public class GatewayProperties {
     private Cache cache = new Cache();
     private Quota quota = new Quota();
     private TokenEstimate tokenEstimate = new TokenEstimate();
+    private Resilience resilience = new Resilience();
     private Router router = new Router();
     private Cost cost = new Cost();
     private List<Provider> providers = new ArrayList<>();
@@ -56,6 +57,131 @@ public class GatewayProperties {
         public void setDefaultLimitTokens(long v) { this.defaultLimitTokens = v; }
         public long getPeriodTtlSeconds() { return periodTtlSeconds; }
         public void setPeriodTtlSeconds(long v) { this.periodTtlSeconds = v; }
+    }
+
+    /**
+     * 重试与熔断（F1）。
+     *
+     * <p><b>为什么参数是全局一份，而不是按 provider 各配一份</b>：
+     * 当前只部署了 1 家 provider，而且"哪家更爱抖"这件事在跑够真机数据之前说不清。
+     * 先给一套全局默认值；等有数据了再加 per-provider 覆盖。
+     * 提前加一层 per-provider 配置，只会让"为什么这家没重试"多一个排查维度，
+     * 而它现在一次都用不上。
+     *
+     * <p>熔断器与重试实例**按 provider 名**分别持有（见 UpstreamResilience）——
+     * 那是必要的：熔断的语义是"这条下游链路不安全"，链路就是 provider，
+     * 两家 provider 的失败绝不能共用一个滑动窗口。
+     */
+    public static class Resilience {
+
+        private Retry retry = new Retry();
+        private CircuitBreaker circuitBreaker = new CircuitBreaker();
+
+        /**
+         * 非流式请求的整体超时。
+         *
+         * <p>WebClient 底座已配了连接超时 3s / 响应超时 60s（WebClientConfig），
+         * 这里再设一层 Reactor timeout 不是重复劳动：netty 的 responseTimeout 只管到
+         * "响应头到达"，而这里是"整条 Mono 完成"。两者覆盖的时间区间不同 ——
+         * 一个管连不上，一个管连上了但不肯说话。
+         */
+        private long timeoutMillis = 60_000;
+
+        /**
+         * 流式请求的<b>首片</b>超时。刻意不是"整条流的超时"。
+         *
+         * <p>一次长回答天然要几十秒，给整条流设超时会把它拦腰砍断。
+         * 真正该被约束的是"多久还没吐出第一个字" —— 用户对首字延迟的体感
+         * 和不耐烦阈值，都发生在那个窗口里。
+         *
+         * <p>实现上直接映射到 {@code Flux.timeout(Duration)}：该方法的作用域
+         * <b>就是首元素</b>，后续元素不再受它约束。参数语义与算子语义天然对齐，
+         * 不需要自己写计时器。
+         *
+         * <p>它同时也是"流式可重试窗口"的时间上界 —— 超过它，就把这次尝试
+         * 当成失败来处理（可能触发重试）。
+         */
+        private long firstChunkTimeoutMillis = 30_000;
+
+        public Retry getRetry() { return retry; }
+        public void setRetry(Retry retry) { this.retry = retry; }
+        public CircuitBreaker getCircuitBreaker() { return circuitBreaker; }
+        public void setCircuitBreaker(CircuitBreaker circuitBreaker) { this.circuitBreaker = circuitBreaker; }
+        public long getTimeoutMillis() { return timeoutMillis; }
+        public void setTimeoutMillis(long v) { this.timeoutMillis = v; }
+        public long getFirstChunkTimeoutMillis() { return firstChunkTimeoutMillis; }
+        public void setFirstChunkTimeoutMillis(long v) { this.firstChunkTimeoutMillis = v; }
+    }
+
+    /**
+     * 重试策略。
+     *
+     * <p>重试谓词本身不在这里 —— 它是代码（见 {@code UpstreamResilience.retryable}），
+     * 因为"哪些错误值得重试"是一条业务判断，不是可调参数：
+     * 重试一个 400 只会把同一个 400 拿回来第二次，还多花一次钱。
+     */
+    public static class Retry {
+        /** 总尝试次数<b>含首次</b>。3 表示"首次 + 最多重试 2 次"。1 = 不重试。 */
+        private int maxAttempts = 3;
+        /** 首次重试前的等待。加等待而不是立刻重试：上游抖动往往需要几百毫秒才缓过来。 */
+        private long waitDurationMillis = 300;
+        /** 指数退避倍数。第 n 次重试等待 = wait × multiplier^(n-1)。 */
+        private double backoffMultiplier = 2.0;
+        /** 退避上限。没有上限的话，maxAttempts 一大就会等到天荒地老（而请求还占着配额）。 */
+        private long maxWaitDurationMillis = 2_000;
+
+        /**
+         * 独立开关，而不是靠"把 max-attempts 设成 1"。
+         *
+         * <p>理由：故障期运维想临时关掉重试时，改 max-attempts 会破坏
+         * "最多 3 次"这个配置的语义；事后回滚时没人知道该改回 3 还是 2。
+         * 一个显式的开关让"故意关的"和"配错了"在管理端点上可以直接区分。
+         */
+        private boolean enabled = true;
+
+        public int getMaxAttempts() { return maxAttempts; }
+        public void setMaxAttempts(int v) { this.maxAttempts = v; }
+        public long getWaitDurationMillis() { return waitDurationMillis; }
+        public void setWaitDurationMillis(long v) { this.waitDurationMillis = v; }
+        public double getBackoffMultiplier() { return backoffMultiplier; }
+        public void setBackoffMultiplier(double v) { this.backoffMultiplier = v; }
+        public long getMaxWaitDurationMillis() { return maxWaitDurationMillis; }
+        public void setMaxWaitDurationMillis(long v) { this.maxWaitDurationMillis = v; }
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean v) { this.enabled = v; }
+    }
+
+    /** 熔断策略。状态机：CLOSED →（失败率超阈值）→ OPEN →（等待期结束）→ HALF_OPEN → CLOSED。 */
+    public static class CircuitBreaker {
+        private boolean enabled = true;
+        /** 滑动窗口大小（按调用次数计）。窗口太小会被单次抖动误判，太大则反应迟钝。 */
+        private int slidingWindowSize = 20;
+        /**
+         * 窗口内至少要攒够这么多次调用才开始计算失败率。
+         *
+         * <p>没有它，启动后前 2 个请求都失败 = 失败率 100% → 立刻熔断。
+         * 而 2 个样本什么也说明不了。这是熔断器最常见的误配置。
+         */
+        private int minimumNumberOfCalls = 8;
+        /** 失败率阈值（百分比）。 */
+        private float failureRateThreshold = 50f;
+        /** 打开后等待多久进入半开。太短起不到"给下游喘息"的作用，太长则恢复慢。 */
+        private long waitDurationInOpenStateMillis = 10_000;
+        /** 半开状态放行几个试探请求。全成功才关闭，任一失败立刻重新打开。 */
+        private int permittedNumberOfCallsInHalfOpenState = 3;
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean v) { this.enabled = v; }
+        public int getSlidingWindowSize() { return slidingWindowSize; }
+        public void setSlidingWindowSize(int v) { this.slidingWindowSize = v; }
+        public int getMinimumNumberOfCalls() { return minimumNumberOfCalls; }
+        public void setMinimumNumberOfCalls(int v) { this.minimumNumberOfCalls = v; }
+        public float getFailureRateThreshold() { return failureRateThreshold; }
+        public void setFailureRateThreshold(float v) { this.failureRateThreshold = v; }
+        public long getWaitDurationInOpenStateMillis() { return waitDurationInOpenStateMillis; }
+        public void setWaitDurationInOpenStateMillis(long v) { this.waitDurationInOpenStateMillis = v; }
+        public int getPermittedNumberOfCallsInHalfOpenState() { return permittedNumberOfCallsInHalfOpenState; }
+        public void setPermittedNumberOfCallsInHalfOpenState(int v) { this.permittedNumberOfCallsInHalfOpenState = v; }
     }
 
     /**
@@ -203,6 +329,8 @@ public class GatewayProperties {
     public void setQuota(Quota quota) { this.quota = quota; }
     public TokenEstimate getTokenEstimate() { return tokenEstimate; }
     public void setTokenEstimate(TokenEstimate v) { this.tokenEstimate = v; }
+    public Resilience getResilience() { return resilience; }
+    public void setResilience(Resilience v) { this.resilience = v; }
     public Router getRouter() { return router; }
     public void setRouter(Router router) { this.router = router; }
     public Cost getCost() { return cost; }

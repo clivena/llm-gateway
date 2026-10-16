@@ -4,8 +4,13 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.llmgw.api.dto.Usage;
 import com.llmgw.core.quota.QuotaExceededException;
+import com.llmgw.core.resilience.UpstreamCircuitOpenException;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 
 import java.util.List;
 
@@ -236,10 +241,74 @@ class OpenAiProtocolTest {
                 OpenAiProtocol.statusOf(new IllegalStateException("upstream error: rate limited")));
     }
 
+    /**
+     * 熔断打开 → 503，且必须是独立的 error type（F1）。
+     *
+     * <p>与 502 分开的理由不是"更精确"，而是<b>给客户端的指令不同</b>：
+     * 502 = "我替你问了，上游答得不对" → 客户端可以立刻重试；
+     * 503 = "我现在不打算替你去问" → 客户端必须退避。
+     * 把熔断也报成 502，就等于在网关已经开始自我保护的时候，
+     * 还用状态码鼓励客户端加速重试 —— 那会把恢复期又拖长。
+     */
+    @Test
+    void circuitOpenMapsTo503WithItsOwnErrorType() throws Exception {
+        UpstreamCircuitOpenException e = new UpstreamCircuitOpenException(
+                "deepseek", new RuntimeException("breaker open"));
+
+        assertEquals(HttpStatus.SERVICE_UNAVAILABLE, OpenAiProtocol.statusOf(e));
+
+        JsonNode node = json(OpenAiProtocol.errorPayload(e));
+        assertEquals("circuit_open", node.get("error").get("type").asText(),
+                "熔断必须有自己的 error type，不能混进 upstream_error");
+        assertTrue(node.get("error").get("message").asText().contains("deepseek"),
+                "错误信息要指出是哪家 provider 的链路被判定为不可用");
+    }
+
+    @Test
+    void emptyAnswerStillMapsTo502Not503() {
+        // 反面：空正文是"上游答了但没答出来"（502），不是"网关拒绝发请求"（503）。
+        // 两者都发生在故障期，混在一起会让告警分不清该查上游还是查网关配置。
+        assertEquals(HttpStatus.BAD_GATEWAY, OpenAiProtocol.statusOf(
+                new com.llmgw.core.resilience.UpstreamEmptyResponseException(
+                        new com.llmgw.api.dto.ChatResponse("id", "m", "",
+                                new com.llmgw.api.dto.Usage(1, 2), false, "length"))));
+    }
+
     @Test
     void unexpectedErrorMapsTo500() {
         assertEquals(HttpStatus.INTERNAL_SERVER_ERROR,
                 OpenAiProtocol.statusOf(new RuntimeException("boom")));
+    }
+
+    /**
+     * <b>F1 补的一个既有缺陷</b>：上游任何非 2xx 都曾落到 500。
+     *
+     * <p>{@code WebClientResponseException} 继承 {@code NestedRuntimeException}，
+     * 既不是 {@code IllegalStateException} 也不是 {@code IllegalArgumentException}，
+     * 于是穿过所有分支掉进最后的 {@code → 500}。客户端看到的是"网关自己崩了"，
+     * 而实际问题在下游 —— 排查方向从一开始就是错的。
+     *
+     * <p>这个缺陷一直存在，只是 F1 之前网关从不重试、上游一次 500 就直接穿过去，
+     * 没人核对过状态码。重试让"重试耗尽"变成一条必然走到的路径之后，
+     * 它才由 scripts/check-resilience.py 的真机断言抓出来。
+     */
+    @Test
+    void upstreamHttpErrorMapsTo502Not500() {
+        for (int code : new int[]{400, 429, 500, 502, 503}) {
+            WebClientResponseException e = WebClientResponseException.create(
+                    code, "from upstream", HttpHeaders.EMPTY, new byte[0], null);
+            assertEquals(HttpStatus.BAD_GATEWAY, OpenAiProtocol.statusOf(e),
+                    "上游 HTTP " + code + " 必须报 502（网关的下游问题），不是 500");
+        }
+    }
+
+    /** 连不上上游（连接被拒 / DNS / TLS）同样是"下游不可达" → 502。 */
+    @Test
+    void upstreamConnectionFailureMapsTo502() {
+        WebClientRequestException e = new WebClientRequestException(
+                new RuntimeException("connection refused"), HttpMethod.POST,
+                java.net.URI.create("http://127.0.0.1:9/v1/chat/completions"), HttpHeaders.EMPTY);
+        assertEquals(HttpStatus.BAD_GATEWAY, OpenAiProtocol.statusOf(e));
     }
 
     @Test

@@ -65,6 +65,38 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-validation</artifactId>
     </dependency>
+
+    <!--
+      重试与熔断（F1）。刻意只引这三个模块，不引 resilience4j-spring-boot3：
+
+        ① 该 starter 的用法是注解（@CircuitBreaker(name="...")），要求熔断器名字
+           在编译期已知；而本项目的 provider 是 gateway.providers[] 动态配的，
+           名字只能在启动期才算出来。注解在这里根本用不上。
+        ② 注解模式依赖 AOP 代理，而本项目主链路是返回 Mono/Flux 的方法 ——
+           代理 + 响应式的组合是经典坑区（自调用失效、类型被擦成 Object）。
+        ③ F2 的故障转移需要按 provider 名查询"下一个候选的熔断器还能不能用"，
+           编程式 Registry 能直接拿到那个状态对象，注解模式拿不到。
+
+      因此走编程式：自己建 CircuitBreakerRegistry / RetryRegistry，
+      用 CircuitBreakerOperator / RetryOperator 把 Mono/Flux 包起来。
+      代价是少一个健康检查端点，已用 /admin/circuit 补上。
+    -->
+    <dependency>
+      <groupId>io.github.resilience4j</groupId>
+      <artifactId>resilience4j-circuitbreaker</artifactId>
+      <version>2.2.0</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.resilience4j</groupId>
+      <artifactId>resilience4j-retry</artifactId>
+      <version>2.2.0</version>
+    </dependency>
+    <!-- 提供 CircuitBreakerOperator / RetryOperator（Mono 与 Flux 通用） -->
+    <dependency>
+      <groupId>io.github.resilience4j</groupId>
+      <artifactId>resilience4j-reactor</artifactId>
+      <version>2.2.0</version>
+    </dependency>
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-configuration-processor</artifactId>

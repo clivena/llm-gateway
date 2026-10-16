@@ -12,6 +12,7 @@ import com.llmgw.core.protocol.ProviderAdapter;
 import com.llmgw.core.protocol.ProviderRegistry;
 import com.llmgw.core.protocol.UpstreamOutcome;
 import com.llmgw.core.quota.QuotaService;
+import com.llmgw.core.resilience.UpstreamResilience;
 import com.llmgw.core.router.ModelTier;
 import com.llmgw.core.router.RouterService;
 import com.llmgw.core.token.TokenEstimator;
@@ -68,6 +69,14 @@ class ChatPipelineQuotaSettleTest {
     @Mock private CostLedgerService ledger;
     @Mock private GatewayMetrics metrics;
     @Mock private ProviderAdapter adapter;
+    /**
+     * 重试/熔断在这一类里被替换成"直通"（F1）。
+     *
+     * 理由：本类测的是**配额结算的口径**，而重试会改变"一次请求到底调用了几次上游"，
+     * 会把这里的断言全部搅浑。真实的重试与熔断行为由 UpstreamResilienceTest
+     * 和 ChatPipelineResilienceTest 各自守。
+     */
+    @Mock private UpstreamResilience resilience;
 
     private final GatewayProperties props = new GatewayProperties();
     private final TokenEstimator estimator = new TokenEstimator(props);
@@ -81,12 +90,19 @@ class ChatPipelineQuotaSettleTest {
     void setUp() {
         props.getCache().setEnabled(true);
         pipeline = new ChatPipeline(quotaService, cacheService, routerService, providers,
-                ledger, metrics, props, estimator);
+                ledger, metrics, props, estimator, resilience);
 
         when(quotaService.tryConsume(anyString(), anyLong())).thenReturn(Mono.just(true));
         when(quotaService.settle(anyString(), anyLong(), anyLong())).thenReturn(Mono.just(0L));
         when(cacheService.write(anyString(), anyString(), anyString())).thenReturn(Mono.empty());
         when(providers.forModel(MODEL)).thenReturn(adapter);
+        // ★ 必须桩上 name()：管线用它做**熔断器的实例键**，返回 null 的话
+        // resilience.protect(...) 是收不到任何调用的 —— 而那种失败的表现是
+        // "配额断言全红 + 一个看不懂的 NPE"，排查方向会完全跑偏。
+        // 真实实现里这个名字来自 provider 配置，永远非空。
+        when(adapter.name()).thenReturn("deepseek");
+        // 直通：把传进来的那条 Mono 原样返回
+        when(resilience.protect(anyString(), any())).thenAnswer(inv -> inv.getArgument(1));
         // 显式指定模型 → 不让路由自作主张升级（否则会静默产生贵模型账单）
         when(routerService.shouldEscalate(any(ModelTier.class), any(), anyBoolean())).thenReturn(false);
     }

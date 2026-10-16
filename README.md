@@ -43,6 +43,11 @@
 
   旁路：TraceIdFilter 生成/透传 traceId · GatewayMetrics 暴露 Prometheus 指标
         AdminController 提供只读运维接口（供 dashboard 读取真实数据）
+
+  韧性（F1，落在 ④ 与 ⑤ 的内侧，按 provider 各一套）：
+        timeouts → CircuitBreaker → Retry → 真实上游调用
+        · 熔断在内、重试在外 —— 熔断要看到每一次尝试，否则失败率被重试稀释
+        · 熔断打开 → 503 + 不再发请求（这是它存在的唯一理由）
 ```
 
 **模块划分**
@@ -55,6 +60,7 @@ src/main/java/com/llmgw/
 │   ├── pipeline/        # ChatPipeline：一次请求的完整编排
 │   ├── protocol/        # ProviderAdapter 抽象 + OpenAiAdapter 实现
 │   ├── router/          # RouterService / RoutingPolicy / ModelTier 分级路由
+│   ├── resilience/      # UpstreamResilience：按 provider 的重试 + 熔断（F1）
 │   ├── cache/           # SemanticCacheService + Redis 向量检索实现
 │   ├── quota/           # QuotaService：Redis + Lua 原子扣减
 │   └── cost/            # CostLedgerService（sink 可切）+ Repository（R2DBC）
@@ -200,6 +206,7 @@ python scripts/run-gateway-smoke.py
 | GET | `/admin/ledger/recent?limit=` | 账本明细（limit 收口 1~200，避免被当全表导出用） |
 | GET | `/admin/ledger/summary` | 账本按租户汇总（对账口径） |
 | GET | `/admin/quota/{apiKey}` | 指定租户当前周期的配额用量 |
+| GET | `/admin/circuit` | 各 provider 的重试 / 熔断状态与失败率（F1） |
 | GET | `/dashboard` | 可视化控制台（同源托管） |
 | GET | `/actuator/prometheus` | Prometheus 指标（含 `llmgw_cache_hit` 等自定义指标） |
 
@@ -211,7 +218,8 @@ python scripts/run-gateway-smoke.py
 |---|---|
 | 400 | 请求不合法——`messages` 为空、`model` 不在服务范围（`error.type = invalid_request_error`） |
 | 429 | 配额超额（`error.type = rate_limit_exceeded`） |
-| 502 | 上游/适配层异常（`error.type = upstream_error`） |
+| 502 | 上游/适配层异常：连不上上游、上游返回非 2xx、上游报错、空响应体（`error.type = upstream_error`） |
+| 503 | **熔断器打开**——请求根本没发给上游（`error.type = circuit_open`，F1） |
 | 500 | 其他内部错误 |
 
 > 早期实现把所有错误都写成 HTTP 200 + 响应体里的 `error` 字段。问题不在于"不够规范"：
@@ -220,6 +228,17 @@ python scripts/run-gateway-smoke.py
 >
 > **400 与 502 的分界是"该不该重试"**：`messages` 为空、`model` 写错是**调用方**的问题，
 > 重试一万次结果一样。把它归成 502 会让客户端误判成网关故障，去退避、去重试，白等一场。
+>
+> **502 与 503 的分界是"我们试没试"**：502 = "我替你问了，上游答得不对"，
+> 客户端该立刻重试；503 = "我现在不打算替你去问"，客户端该**退避**。
+> 把熔断也报成 502，就等于在网关已经开始自我保护的时候，
+> 还在用状态码鼓励客户端加速重试。
+>
+> ⚠️ 502 这一行是 F1 补上的：`WebClientResponseException` 继承 `NestedRuntimeException`，
+> 既不是 `IllegalStateException` 也不是 `IllegalArgumentException`，
+> 于是**上游任何非 2xx 都曾落到 500**。这个缺陷一直在，只是网关从不重试时
+> 上游一次 500 就直接穿过去，没人核对过状态码 —— 是
+> `check-resilience.py` 的断言把它抓出来的。
 
 ---
 
@@ -279,7 +298,8 @@ python scripts/run-gateway-smoke.py
 > `python scripts/check-quota-concurrency.py`（配额并发，自带 6 条断言）、
 > `python scripts/calibrate-token-estimator.py`（配额估算精度，六组探针）、
 > `python scripts/check-cache-layers.py`（缓存是否真的命中，8 条断言）、
-> `python scripts/check-f0-failure-semantics.py`（推理型模型失败语义 + 配额结算，8 条断言）。
+> `python scripts/check-f0-failure-semantics.py`（推理型模型失败语义 + 配额结算，8 条断言）、
+> `python scripts/check-resilience.py`（重试 + 熔断，11 条断言，含本地桩）。
 > 五条脚本都会自己起服务、摘除端口劫持环境变量、跑完自动关服务，
 > 并**在开始前检查 Redis/Postgres 容器是否在跑**（缺依赖时失败会长得像代码 bug）。
 
@@ -344,6 +364,32 @@ python scripts/run-gateway-smoke.py
 > 在答案被截断时以为一切都好。
 > 这类问题在监控上看起来一切正常。
 
+### F1 验证（重试 + 熔断）
+
+`check-resilience.py` —— **11/11 PASS**。分两段跑，因为两类问题只有不同的上游能回答：
+**A 段打真实 DeepSeek**（重试在真实失败上到底会不会触发，取决于上游的实际行为），
+**B 段打本地桩**（重试了几次、熔断后有没有再发请求 —— 精确计数只能由能计数的上游给出）。
+
+| 检查 | 结果 |
+|---|---|
+| 空正文触发重试，且重试耗尽后 F0 的透传不被破坏 | 重试增量 **2**（= `maxAttempts-1`）<br>客户端拿到 **HTTP 200 + `finish_reason='length'`**，不是 502 |
+| 正常答案不被重试（对照） | 重试增量 **0**，正文 760 字 |
+| `/admin/circuit` 可读、上游健康时 CLOSED | `state=CLOSED`，buffered=4 failed=3 successful=1 |
+| **重试真的重新发起了请求** | 桩设定"前 2 次 500"→ 桩收到 **3** 次，最终拿到成功响应 |
+| 重试耗尽如实报 502 | HTTP **502** + `type=upstream_error`，桩收到 3 次 |
+| 熔断在连续失败后打开 | **1 轮**后 `state=OPEN` |
+| **熔断后不再发请求** | HTTP **503** + `type=circuit_open`，桩请求数 **4 → 4 未变** |
+| 熔断可自动恢复 | `OPEN` → 10s → `HALF_OPEN` → 3 次成功 → `CLOSED` |
+| **流式首片前重试不产生重复内容** | 桩收到 **2** 次流式请求，客户端正文 = 期望值（无重复拼接） |
+| F1 指标带 provider 标签 | `upstream.retry`=6 · `circuit.rejected`=2 · `circuit.open`=0 |
+
+其中两条是这套验证真正的价值所在，因为它们**无法用状态码证明**：
+
+- **"桩收到 3 次"** —— 一个把旧响应缓存起来的实现同样会返回 200、正文正确、
+  日志也打了"retrying"。只有**上游自己的计数**能证明那 3 次请求真的发生了。
+- **"桩请求数 4 → 4 未变"** —— 熔断状态显示 OPEN、`circuit.rejected` 涨了，
+  都不等于上游真的被放过了。这正是熔断存在的唯一理由，也是唯一能证明它的方式。
+
 ---
 
 ## 已知边界（诚实清单）
@@ -377,8 +423,13 @@ python scripts/run-gateway-smoke.py
    只有拿不到时才回退估算 —— 回退值不冒充真实值。
 5. **单价是示例值**：`gateway.pricing` 必须按自己的账单口径替换；也缺少日终对账任务。
 6. **`/admin/*` 无鉴权**：只适合本机/内网，上公网前必须加。
-7. **重试与熔断尚未接上**：响应式化只是**前置条件**（接口不再是同步签名，算子才有地方挂），
-   `timeout` / `retryWhen` / 跨 provider 故障转移还没实现。
+7. ~~**重试与熔断尚未接上**~~ → **已接上（F1）**，但**跨 provider 故障转移还没做**：
+   `UpstreamResilience` 按 provider 各持一套熔断器与重试（Resilience4j 2.2.0，
+   编程式而非注解 —— provider 是配置里动态来的，注解要静态名字）。
+   熔断打开后返回 **503** 并**不再发请求**（已用本地桩的上游计数验证）。
+   链路上现在是 `timeout → CircuitBreaker → Retry → 真实上游调用`，
+   熔断在内、重试在外，顺序不可颠倒（理由见 [step-19](./docs/step-19-retry-and-circuit-breaker.md)）。
+   **F2（故障转移）未做**：熔断打开目前只返回 503，不会自动转移给下一个 provider。
 8. **运行期日志是中文**：Windows 控制台默认 GBK(936)，Java 也按 GBK 输出，
    在 cmd 里正常；但管道/重定向被按 UTF-8 解码时会显示为乱码。
    面向开源协作者，后续应把启动与配置类日志改成英文（代码注释可以保留中文）。
@@ -417,6 +468,28 @@ python scripts/run-gateway-smoke.py
     解析层已经用了 `flatMapIterable` 允许一帧映射出多个分片，
     但**换供应商仍应重新跑一遍 `scripts/check-f0-failure-semantics.py`**。
 
+### F1 新增的边界
+
+11. **重试的中间几次尝试不计入账本**：账本只为"最终交给客户端的那一次"落一条
+    （不变量 C 的口径）。一次重试 2 次的请求 = 3 次真实计费，账本记 1 次 ——
+    成本归因在故障期系统性偏低，而故障期恰恰是重试最多的时候。
+    配额侧是准的。**列为下一批待办**：每次尝试单独落账。
+    另外注意**每次重试都是一次真实计费**，调大 `max-attempts` 前先想清楚故障期的账单。
+12. **重试与熔断的参数是全局一份，没有 per-provider 覆盖**：当前只部署 1 家 provider，
+    "哪家更爱抖"在跑够数据之前说不清。提前加一层只会让"为什么这家没重试"
+    多一个排查维度。熔断器/重试**实例**本身是按 provider 分的，只是参数共享。
+13. **上游 429 不透传为 429**：上游限流被统一归到 502。不透传是因为我们自己的
+    429 有明确含义（**本租户**配额用尽），混进上游的限流会让客户端分不清该找谁。
+    同理，上游任何非 2xx 都报 502，不透传原始状态码 ——
+    网关能自己识别的调用方错误（`messages` 为空、模型不在服务范围）在进上游之前就拦掉了。
+14. **不读 `Retry-After`**：429 的退避走统一指数退避；上游若给了很长的 `Retry-After`，
+    我们会在它说的窗口之前就重试。
+15. **流的"中途卡住"没有防护**：`Flux.timeout()` 只约束**首片**
+    （这是刻意的 —— 给整条流设超时会拦腰砍断长回答）。首片之后若上游停止发送
+    但不断开连接，请求会一直挂着。要覆盖它需要按分片做空闲超时，属另一个改动。
+16. **熔断打开时无法自动恢复被拒请求**：上层不重试、不排队，客户端自己退避。
+    这是 F1 的刻意范围（F2 才会把"转移给下一个 provider"接上）。
+
 ---
 
 ## 踩过的坑（都是真实调试记录）
@@ -431,6 +504,9 @@ python scripts/run-gateway-smoke.py
 3. **Kafka "异步"发送拖死响应**——`KafkaTemplate.send()` 在 broker 不可达时会阻塞到 `max.block.ms`（默认 60s）才抛异常，导致每个请求多花 60 秒。压到 500ms 并把落账放到独立线程后，响应回到 3.4s。
 4. **健康端点 503 不等于服务没起来**——Redis 未就绪时 `/actuator/health` 返回 503，用它做就绪判断会把"已启动"误判成"启动失败"。改用 TCP 端口探测。
 5. **`SERVER__PORT` 端口劫持**——宿主环境注入的 `SERVER__PORT` 被 Spring Boot 的宽松绑定当成 `server.port`，服务起在了错误端口上，报 `Port <注入值> was already in use`。用命令行参数强制覆盖。
+6. **`SynchronousSink` 一次只允许 `next()` 一个元素（F0）**——DeepSeek 的末帧**同时带 `usage` 与 `finish_reason`**，两个分支各发一次就把整条流打成 502（`Cannot emit more than one data`）。而在此之前它一直是好的：普通增量帧没有 usage、用量帧没有 choices，两个分支从未同时命中。**旧写法是靠数据形状的巧合在运行**。修法是 `handle` → `flatMapIterable`。
+7. **`WebClientException` 没被状态码映射覆盖（F1）**——上游任何非 2xx 都曾落到 `500`。`WebClientResponseException` 继承 `NestedRuntimeException`，既不是 `IllegalStateException` 也不是 `IllegalArgumentException`，穿过所有分支掉进最后的兜底。**这个缺陷一直存在**，只是网关从不重试时上游一次 500 就直接穿过去，没人核对过状态码；重试让"重试耗尽"变成必然走到的路径之后，它才被真机断言抓出来。教训：**新的失败路径会把旧代码里从没被认真走过的分支变成主路径。**
+8. **Mockito 的 `anyString()` 不匹配 `null`（F1）**——`ChatPipelineQuotaSettleTest` 里 8 条断言全红，报的却是一个看不懂的 NPE：管线用 `adapter.name()` 做熔断器实例键，而那个 mock 没桩 `name()` → 返回 `null` → `anyString()` 不匹配 → 桩未生效 → 走默认返回 `null`。一个方法返回值参与后续控制流时，漏桩它会以**另一个地方的 NPE** 的形式出现。
 
 ---
 
@@ -454,12 +530,13 @@ python scripts/run-gateway-smoke.py
 | [16](./docs/step-16-reactive-multi-provider.md) | 响应式化 + 多 provider + 路由配置化（让"非阻塞"可 grep 验证） |
 | [17](./docs/step-17-token-estimate-and-cache-layers.md) | **估算从"猜"变"算"**：`TokenEstimator` + 缓存拆两级 + MDC 贯通 |
 | [18](./docs/step-18-reasoning-model-failure-semantics.md) | **推理型模型的失败语义**：`finish_reason` 透传 + 配额 reserve-then-settle |
+| [19](./docs/step-19-retry-and-circuit-breaker.md) | **重试与熔断**：Resilience4j 算子嵌套 + 流式重试闸门 + 失败路径的配额结算 |
 
 ---
 
 ## 技术栈
 
-Java 17 · Spring Boot 3.3 · WebFlux / Reactor · Redis（Reactive + RediSearch）· PostgreSQL（R2DBC）· Kafka · Micrometer / Prometheus · Maven
+Java 17 · Spring Boot 3.3 · WebFlux / Reactor · Resilience4j 2.2 · Redis（Reactive + RediSearch）· PostgreSQL（R2DBC）· Kafka · Micrometer / Prometheus · Maven
 
 ---
 

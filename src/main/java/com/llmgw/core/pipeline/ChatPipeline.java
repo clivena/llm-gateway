@@ -12,6 +12,9 @@ import com.llmgw.core.protocol.StreamChunk;
 import com.llmgw.core.protocol.UpstreamOutcome;
 import com.llmgw.core.quota.QuotaExceededException;
 import com.llmgw.core.quota.QuotaService;
+import com.llmgw.core.resilience.UpstreamCircuitOpenException;
+import com.llmgw.core.resilience.UpstreamEmptyResponseException;
+import com.llmgw.core.resilience.UpstreamResilience;
 import com.llmgw.core.router.ModelTier;
 import com.llmgw.core.router.RouterService;
 import com.llmgw.core.router.RoutingPolicy;
@@ -20,6 +23,7 @@ import com.llmgw.observability.GatewayMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
@@ -48,6 +52,10 @@ import java.util.concurrent.atomic.AtomicReference;
  *   A. 落账只能走 recordAsync —— 任何一次同步 ledger.record 都可能把响应拖住。
  *   B. 缓存 namespace 必须带模型维度 —— 否则强模型的答案会被弱模型请求命中。
  *   C. 每一次真实发生的上游调用都要落一条账 —— 级联升级时是两次调用、两份费用。
+ *   D. 每一次预扣都必须有结算，**包括失败路径**（F1）——
+ *      在此之前，上游报错 / 熔断 / 连不上的请求会**白吃掉一整笔预扣**：
+ *      一次都没调通，配额却按预扣额扣掉了。平时看不出来，
+ *      但因为熔断本身就是"连续失败"触发的，F1 会让这条泄漏在故障期集中爆发。
  */
 @Service
 public class ChatPipeline {
@@ -62,6 +70,7 @@ public class ChatPipeline {
     private final GatewayMetrics metrics;
     private final GatewayProperties properties;
     private final TokenEstimator tokenEstimator;
+    private final UpstreamResilience resilience;
 
     public ChatPipeline(QuotaService quotaService,
                         SemanticCacheService cacheService,
@@ -70,7 +79,8 @@ public class ChatPipeline {
                         CostLedgerService ledger,
                         GatewayMetrics metrics,
                         GatewayProperties properties,
-                        TokenEstimator tokenEstimator) {
+                        TokenEstimator tokenEstimator,
+                        UpstreamResilience resilience) {
         this.quotaService = quotaService;
         this.cacheService = cacheService;
         this.routerService = routerService;
@@ -79,6 +89,7 @@ public class ChatPipeline {
         this.metrics = metrics;
         this.properties = properties;
         this.tokenEstimator = tokenEstimator;
+        this.resilience = resilience;
     }
 
     public Mono<ChatResponse> execute(String apiKey, ChatRequest request, String traceId) {
@@ -184,7 +195,7 @@ public class ChatPipeline {
         // 账本与配额两个口径必须一致，否则对不上账时不知道信哪个。
         AtomicLong spentTokens = new AtomicLong(0);
 
-        return adapter.chat(tier.model(), request)
+        return callUpstream(adapter, tier.model(), request)
                 .flatMap(response -> {
                     // F0：先判定"上游到底给了什么"，再谈怎么处理。
                     UpstreamOutcome outcome = UpstreamOutcome.of(response.content(), response.finishReason());
@@ -210,7 +221,10 @@ public class ChatPipeline {
 
                         ModelTier stronger = routerService.escalateFrom(tier);
                         ProviderAdapter strongAdapter = providers.forModel(stronger.model());
-                        return strongAdapter.chat(stronger.model(), request)
+                        // 升级后的这一次同样走重试 + 熔断 —— 用的是**另一家** provider
+                        // 的熔断器（按 provider 名分实例）。这正是 F2 要利用的形状：
+                        // 便宜那家的熔断器打开了，不代表升级目标那家也不健康。
+                        return callUpstream(strongAdapter, stronger.model(), request)
                                 .map(upgraded -> new ChatResponse(upgraded.id(), stronger.model(),
                                         upgraded.content(), upgraded.usage(), false,
                                         upgraded.finishReason()));
@@ -247,7 +261,52 @@ public class ChatPipeline {
                     // 换来一个容易验证的不变量 —— "响应已返回 ⇒ 配额已结清"。
                     // 若改为异步，配额面板就可能比账本慢一拍，对账时说不清谁是对的。
                     return settleQuota(apiKey, reserved, spentTokens.get()).thenReturn(response);
+                })
+                // 不变量 D（F1）：失败路径也必须结算。
+                // 以前这里直接让异常穿过去，于是预扣那笔**永远留在账上** ——
+                // 上游 502、熔断打开、连不上，全都白扣一次配额。
+                // 用 spentTokens 而不是 reserved 作为 actual：级联升级时第一次调用
+                // 已经真实花掉的钱必须照扣，否则升级前那次的成本就凭空消失了。
+                // spentTokens 为 0 时由 chargedOnFailure 决定"退还还是保守保留"。
+                .onErrorResume(e -> settleQuota(apiKey, reserved,
+                                chargedOnFailure(e, spentTokens.get(), reserved))
+                        .then(Mono.error(e)));
+    }
+
+    /**
+     * 一次上游调用，带重试与熔断（F1）。
+     *
+     * <h3>为什么要在这里把"空正文"转成异常、再在末尾转回响应</h3>
+     * 重试算子只认错误信号，而"HTTP 200 + 空正文 + finish_reason=length"在传输层
+     * 是彻底的成功（F0 的四分表第一行说明它有多容易被当成正常响应）。
+     * 所以进重试边界前把它翻译成 {@link UpstreamEmptyResponseException}，
+     * 出边界后再翻译回来。
+     *
+     * <p>末尾那一步 <b>不是可选的</b>：重试耗尽后必须把上游那次**原始响应**交还给上层。
+     * 少了它，客户端会从"200 + finish_reason=length + 空正文"退化成 502 ——
+     * 那正是 F0 刚刚修掉的"把被截断伪装成正常结束"的镜像错误：
+     * 这次是把"上游明确说明了原因"伪装成"网关坏了"。
+     *
+     * <p>还要注意<b>重试的每一次尝试都会真的花钱</b>。当前实现只为"最终交给客户端的那次"
+     * 落账（不变量 C 的账本口径），重试中间那几次的用量没有进账本 ——
+     * 见 docs/step-19 的已知边界，这是刻意留的取舍。
+     */
+    private Mono<ChatResponse> callUpstream(ProviderAdapter adapter, String model, ChatRequest request) {
+        // ★ Mono.defer 不是多余的包装，它是"重试 = 真的再发一次请求"这句承诺的实现。
+        // adapter.chat() 返回的是一条**冷** Publisher，每次订阅才会真正出网；
+        // 但"冷"是当前 OpenAiAdapter 的实现细节，不是 ProviderAdapter 接口的契约。
+        // 万一将来有人写出一个会复用/缓存内部 Publisher 的适配器，
+        // 重试就会变成"把上一次的旧响应再吐一遍"—— 看起来重试成功了，
+        // 实际上一次请求都没发出去，而且没有任何报错。defer 把契约写进代码里。
+        Mono<ChatResponse> attempt = Mono.defer(() -> adapter.chat(model, request))
+                .map(resp -> {
+                    if (UpstreamOutcome.of(resp.content(), resp.finishReason()).empty()) {
+                        throw new UpstreamEmptyResponseException(resp);
+                    }
+                    return resp;
                 });
+        return resilience.protect(adapter.name(), attempt)
+                .onErrorResume(UpstreamEmptyResponseException.class, e -> Mono.just(e.response()));
     }
 
     private Flux<StreamChunk> streamDispatch(String apiKey, ChatRequest request, String question,
@@ -266,8 +325,17 @@ public class ChatPipeline {
         long start = System.currentTimeMillis();
         // 待结算的真实用量。-1 表示"还没走到流结束"，此时不该结算。
         AtomicLong settleAmount = new AtomicLong(-1);
+        // F1：上游是否**真的**产出过分片。一个标记服务两个判断，两者是同一个事实：
+        //   ① 重试闸门 —— 一个分片都没产出时才允许重试（否则会重复推送内容）
+        //   ② 失败时的配额口径 —— 产出过就说明确实花了钱，不能退预扣
+        // 交给 UpstreamResilience 写入：它把标记挂在重试边界**之外**，
+        // 因此被重试丢弃的那次尝试产出的分片不会被算进来。
+        AtomicBoolean upstreamProduced = new AtomicBoolean(false);
 
-        Flux<StreamChunk> primary = cheap.chatStream(tier.model(), request)
+        Flux<StreamChunk> primary = resilience.protectStream(cheap.name(),
+                        // Flux.defer 的理由同 callUpstream：把"每次重试都重新发起一次
+                        // 流式调用"写成代码里的承诺，而不是依赖适配器的"冷 Publisher"这个实现细节。
+                        Flux.defer(() -> cheap.chatStream(tier.model(), request)), upstreamProduced)
                 .doOnNext(chunk -> collect(chunk, emitted, collected, upstreamUsage, finishReason));
 
         Flux<StreamChunk> body = primary
@@ -281,9 +349,15 @@ public class ChatPipeline {
                             // 换了模型，上一次调用留下的 finish_reason 必须清掉：
                             // 那是"便宜模型为什么被换掉"的原因，不是最终答案的原因。
                             finishReason.set(null);
-                            return providers.forModel(stronger.model())
-                                    .chatStream(stronger.model(), request)
-                                    .doOnNext(chunk -> collect(chunk, emitted, collected, upstreamUsage, finishReason));
+                            ProviderAdapter strong = providers.forModel(stronger.model());
+                            // 升级后的流同样走重试 + 熔断，用的是那家 provider 自己的熔断器。
+                            // 复用同一个 upstreamProduced：便宜那家一个分片都没给出来过，
+                            // 所以闸门在这里仍然是开的 —— 这正是我们还能升级的前提。
+                            return resilience.protectStream(strong.name(),
+                                            Flux.defer(() -> strong.chatStream(stronger.model(), request)),
+                                            upstreamProduced)
+                                    .doOnNext(chunk -> collect(chunk, emitted, collected,
+                                            upstreamUsage, finishReason));
                         }))
                 .doOnComplete(() -> {
                     long latency = System.currentTimeMillis() - start;
@@ -316,13 +390,24 @@ public class ChatPipeline {
         // 理由是那个可验证的不变量："客户端收到 [DONE] ⇒ 配额已结清"。
         // 若用 doFinally 会把"客户端中途断开"也当成完成去结算 —— 而那种情况下
         // 上游已经花了钱，预扣本就该留着。
-        return body.concatWith(Flux.defer(() -> {
+        Flux<StreamChunk> settled = body.concatWith(Flux.defer(() -> {
             long amount = settleAmount.get();
             if (amount < 0) {
                 return Flux.empty();
             }
             return settleQuota(apiKey, reserved, amount).thenMany(Flux.<StreamChunk>empty());
         }));
+
+        // 不变量 D（F1）：流断掉也必须结算。
+        // 注意这里用的是**流式**口径而不是非流式的 spentTokens：
+        // 流式的真实用量只在末帧给出，流一旦断掉就永远等不到那一帧，
+        // 所以"已经花了多少"只能靠"有没有分片出来过"来推断。
+        // 熔断打开 / 连不上这两种"确定一分钱没花"的情况由 chargedOnFailure 退还。
+        return settled.onErrorResume(e -> {
+            long known = upstreamUsage.get() == null ? 0 : upstreamUsage.get().total();
+            return settleQuota(apiKey, reserved, chargedOnFailure(e, known, reserved))
+                    .thenMany(Flux.error(e));
+        });
     }
 
     /** 累积一条上游分片：文本进缓冲，用量与收尾原因进引用。用量/收尾帧不影响 emitted（它们没有内容）。 */
@@ -407,6 +492,61 @@ public class ChatPipeline {
             log.warn("upstream returned unusable response [{} model={} finish_reason={}]: {} usage={}",
                     path, model, outcome.finishReason(), outcome.describe(), usage);
         }
+    }
+
+    /**
+     * 失败路径上"这次请求到底该记多少 token"（F1，不变量 D 的另一半）。
+     *
+     * <h3>为什么不能简单地在失败时退掉整笔预扣</h3>
+     * 直觉上"请求失败了就该退钱"，但上游对失败的请求并非都不计费：
+     * <ul>
+     *   <li>上游 5xx：请求已经送到，prompt 部分大概率已经计费。</li>
+     *   <li>首片超时：上游可能正在生成，费用已经在产生。</li>
+     *   <li>流中途断掉：前面那些分片是真实产出的 token。</li>
+     * </ul>
+     * 一律退还等于把"真实花掉的钱"记成免费，而且这条路径恰恰集中在故障期 ——
+     * 退得最多的时候正是最需要配额起到止血作用的时候。
+     *
+     * <h3>但也不能一律保留预扣</h3>
+     * 因为熔断正是"连续失败"打开的，而熔断打开的请求<b>一个字节都没发出去</b>。
+     * 一次都不退还的话，上游整体挂掉的那段时间里，每个被拒的请求都会白吃掉
+     * 一整笔预扣 —— F1 引入的新失败模式反而成了最大的配额泄漏点。
+     *
+     * <h3>取舍规则：只在"确定没花钱"时才退还，不确定时保留预扣</h3>
+     * 两个方向的错都不是一样重：少退一次 = 用户多扣了一点额度（可事后补偿），
+     * 多退一次 = 故障期的配额上限失效（不可逆）。所以默认取保守方向，
+     * 只有能<b>确定</b>请求没到上游时才退还。
+     *
+     * @param knownUsage 已经拿到的真实用量（非流式是 spentTokens，流式是末帧 usage）；拿不到传 0
+     * @param reserved   本次请求的预扣额，作为"不知道花了多少"时的保守估计
+     */
+    private static long chargedOnFailure(Throwable e, long knownUsage, long reserved) {
+        if (knownUsage > 0) {
+            // 已经有真实用量（级联升级时第一次调用的用量）—— 用它，别猜。
+            return knownUsage;
+        }
+        if (neverReachedUpstream(e)) {
+            return 0;
+        }
+        return reserved;
+    }
+
+    /**
+     * 这次失败是否<b>确定</b>没有到达上游、因此确定没有产生费用。
+     *
+     * <p>只列两种能"确定"的情况，其余一律当成"可能已经计费"：
+     * <ul>
+     *   <li>熔断打开 —— 请求在网关内部就被拦下了，连 TCP 连接都没建。</li>
+     *   <li>{@link WebClientRequestException} —— 连接被拒 / DNS 失败 / TLS 握手失败，
+     *       请求到不了模型。注意这个异常也覆盖"响应读到一半连接被重置"，
+     *       那种情况下上游其实可能已经计费了 —— 这是本判断刻意接受的一处低估，
+     *       因为它在真实故障里占比极低，而为它单独加一层区分会让规则难以解释。</li>
+     * </ul>
+     * 特别地，{@code TimeoutException} 不在此列：请求已经发出去了，上游可能正在算。
+     */
+    private static boolean neverReachedUpstream(Throwable e) {
+        return e instanceof UpstreamCircuitOpenException
+                || e instanceof WebClientRequestException;
     }
 
     /**

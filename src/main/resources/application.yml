@@ -56,6 +56,32 @@ gateway:
   quota:
     default-limit-tokens: 200000
     period-ttl-seconds: 3024000
+  # 重试与熔断（F1）。生效方式见 core/resilience/UpstreamResilience。
+  # ★ 这几个参数是全局的，还没有 per-provider 覆盖 —— 理由见 GatewayProperties.Resilience。
+  resilience:
+    # 非流式请求的整体超时。与 WebClientConfig 的 netty responseTimeout(60s) 不重复：
+    # 那个只管到"响应头到达"，这里管"整条 Mono 完成"。
+    timeout-millis: 60000
+    # 流式的**首片**超时，不是整条流的超时 —— 长回答天然要几十秒，
+    # 给整条流设超时会把它拦腰砍断。映射到 Flux.timeout()，其作用域本就是首元素。
+    first-chunk-timeout-millis: 30000
+    retry:
+      enabled: true
+      # 总尝试次数含首次：3 = 首次 + 最多重试 2 次。
+      # ★ 每次重试都是一次**真实计费**的上游调用，调大前先想清楚故障期的账单。
+      max-attempts: 3
+      wait-duration-millis: 300
+      backoff-multiplier: 2.0
+      max-wait-duration-millis: 2000
+    circuit-breaker:
+      enabled: true
+      sliding-window-size: 20
+      # ★ 这一项没有它，启动后头 2 个请求失败（失败率 100%）就会直接熔断 ——
+      #   而 2 个样本什么都说明不了。熔断器最常见的误配置就是漏了它。
+      minimum-number-of-calls: 8
+      failure-rate-threshold: 50
+      wait-duration-in-open-state-millis: 10000
+      permitted-number-of-calls-in-half-open-state: 3
   # Token 估算系数 —— 配额预扣与兜底计费共用这一套口径。
   # ★ 这些是**实测校准值**，不是经验常数：token 数由上游的分词器决定，随供应商与
   #   模型版本变化。当前值来自 2026-10-16 对 deepseek-flash 的真机实测

@@ -3,6 +3,7 @@ package com.llmgw.api;
 import com.llmgw.config.GatewayProperties;
 import com.llmgw.core.cost.CostLedgerRepository;
 import com.llmgw.core.quota.QuotaService;
+import com.llmgw.core.resilience.UpstreamResilience;
 import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -31,13 +32,16 @@ public class AdminController {
     private final QuotaService quota;
     private final GatewayProperties properties;
     private final DatabaseClient db;
+    private final UpstreamResilience resilience;
 
     public AdminController(CostLedgerRepository ledger, QuotaService quota,
-                           GatewayProperties properties, DatabaseClient db) {
+                           GatewayProperties properties, DatabaseClient db,
+                           UpstreamResilience resilience) {
         this.ledger = ledger;
         this.quota = quota;
         this.properties = properties;
         this.db = db;
+        this.resilience = resilience;
     }
 
     /** 账本明细，按 id 倒序。limit 收口在 1~200，避免被当成"全表导出"接口用。 */
@@ -93,6 +97,22 @@ public class AdminController {
         tokenEstimate.put("safetyFactor", properties.getTokenEstimate().getSafetyFactor());
         out.put("tokenEstimate", tokenEstimate);
         return Mono.just(out);
+    }
+
+    /**
+     * 各 provider 的重试 / 熔断状态（F1）。
+     *
+     * <p>为什么要单独开一个端点而不是只靠 Prometheus：熔断状态需要
+     * "现在开着吗 + 为什么（失败率多少、窗口里几个样本）"这种<b>带上下文</b>的读法，
+     * 面板上光看到一个 0/1 的 Gauge 是没法判断"该不该人工干预"的。
+     * 而且故障期人第一个会打开的就是这个页面 —— 那时候不该让他去拼 PromQL。
+     *
+     * <p>与 /admin/* 的其余接口一样：只读，不触发任何上游调用。
+     * 注意它读的是熔断器的**当前状态**（含半开时的实时计数），不是快照历史。
+     */
+    @GetMapping("/circuit")
+    public Mono<Map<String, Object>> circuit() {
+        return Mono.just(resilience.states());
     }
 
     /**

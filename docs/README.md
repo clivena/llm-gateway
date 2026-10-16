@@ -19,8 +19,9 @@
 | 16 | 响应式化 + 多 provider + 路由配置化 | [step-16](./step-16-reactive-multi-provider.md) |
 | 17 | **估算从"猜"变"算"** + 缓存拆两级 + MDC 贯通 | [step-17](./step-17-token-estimate-and-cache-layers.md) |
 | 18 | 推理型模型的失败语义 + 配额 reserve-then-settle（F0） | [step-18](./step-18-reasoning-model-failure-semantics.md) |
+| 19 | **重试与熔断**：Resilience4j 算子嵌套 + 流式重试闸门 + 失败路径配额结算（F1） | [step-19](./step-19-retry-and-circuit-breaker.md) |
 
-> 16 与 17 均已成篇。14 号步骤当时未单独成篇，内容并入 [step-15](./step-15-review-fixes.md)。
+> 16~19 均已成篇。14 号步骤当时未单独成篇，内容并入 [step-15](./step-15-review-fixes.md)。
 > 当前状态与已知边界见 [README 的已知边界](../README.md#已知边界诚实清单)。
 
 ---
@@ -40,6 +41,9 @@
 | [step-03](./step-03-chat-pipeline.md) / [step-05](./step-05-quota-lua.md) | 配额是"一次原子预扣"，扣的就是本次消耗 | **已变更**：改成 reserve-then-settle 两段式。预扣只按 prompt 估算，响应后按真实 usage 补扣；缓存命中全额退还（见 [step-18](./step-18-reasoning-model-failure-semantics.md)） |
 | [step-02](./step-02-upstream-adapter.md) | 非流式只取 `message.content` | **已增强**：同时透传 `finish_reason`；流式补上收尾帧。硬编码 `"stop"` 会把"被截断"报成"正常结束"（见 [step-18](./step-18-reasoning-model-failure-semantics.md)） |
 | [step-03](./step-03-chat-pipeline.md) | 管线里用 `Flux.defer(...)` 包住同步调用 + `subscribeOn` 挪出事件循环 | **不成立**：适配器接口本身已返回 `Mono`/`Flux`，全链路 `.block()` 残留为 0 |
+| [step-16](./step-16-reactive-multi-provider.md) | 响应式化是"后续重试与熔断的**硬前提**"（当时重试熔断尚未实现） | **前提已兑现**：`timeout` / 重试 / 熔断全部落在 Reactor 算子上（见 [step-19](./step-19-retry-and-circuit-breaker.md)） |
+| [step-15](./step-15-review-fixes.md) | 错误码映射：上游/适配层异常 → 502 | **当时只覆盖到 `IllegalStateException`**。`WebClientResponseException` 继承 `NestedRuntimeException`，于是**上游任何非 2xx 实际都落到 500** —— 这个缺陷一直到 F1 靠真机断言才被抓出来（见 [step-19](./step-19-retry-and-circuit-breaker.md)） |
+| [step-03](./step-03-chat-pipeline.md) / [step-18](./step-18-reasoning-model-failure-semantics.md) | 配额结算只覆盖**成功**路径 | **已变更（不变量 D）**：失败路径也结算，且"确定没到达上游"（熔断 / 连不上）时全额退还预扣（见 [step-19](./step-19-retry-and-circuit-breaker.md)） |
 
 ---
 

@@ -6,6 +6,7 @@ import com.llmgw.api.dto.ChatRequest;
 import com.llmgw.api.dto.ChatResponse;
 import com.llmgw.api.dto.Usage;
 import com.llmgw.config.GatewayProperties;
+import com.llmgw.core.resilience.UpstreamEmptyBodyException;
 import com.llmgw.core.token.TokenEstimator;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.MediaType;
@@ -97,7 +98,10 @@ public class OpenAiAdapter implements ProviderAdapter {
                 .retrieve()
                 .bodyToMono(JsonNode.class)
                 // 空响应体是上游异常，不能当成"内容为空"放行 —— 那样会写进一条金额为 0 的假账
-                .switchIfEmpty(Mono.error(new IllegalStateException("empty response from upstream")))
+                // 用专用异常而不是 IllegalStateException("...")：
+                // 重试谓词（F1）需要识别"这次失败值得再试一次"，靠 message 文本
+                // 判断控制流，改一句文案就会静默改变重试行为。
+                .switchIfEmpty(Mono.error(new UpstreamEmptyBodyException(model)))
                 .map(node -> toChatResponse(node, model));
     }
 

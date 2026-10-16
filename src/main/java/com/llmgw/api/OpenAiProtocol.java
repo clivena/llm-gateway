@@ -2,7 +2,9 @@ package com.llmgw.api;
 
 import com.llmgw.api.dto.Usage;
 import com.llmgw.core.quota.QuotaExceededException;
+import com.llmgw.core.resilience.UpstreamCircuitOpenException;
 import org.springframework.http.HttpStatus;
+import org.springframework.web.reactive.function.client.WebClientException;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -173,12 +175,48 @@ public final class OpenAiProtocol {
      * 而重试一万次结果都一样。
      *   - IllegalArgumentException → 400：错在调用方（messages 为空、model 不在服务范围）
      *   - 配额超额              → 429：客户端应退避
+     *   - 熔断打开              → 503：网关主动拒绝，客户端应<b>退避更久</b>（F1）
+     *   - 上游出网异常          → 502：连不上上游、或上游返回非 2xx（F1 补）
      *   - IllegalStateException → 502：网关下游的问题（上游报错、空响应体）
      *   - 其他                  → 500
+     *
+     * <p><b>为什么 503 必须排在 502 前面、且不能合并</b>：
+     * 502 的含义是"我替你问了上游，上游答得不对"，503 是"我现在不打算替你去问"。
+     * 对客户端而言这是两种完全不同的指令 —— 收到 502 该立刻重试（上游可能抽风），
+     * 收到 503 该退避（我们已经主动熔断，猛打只会把恢复期拖得更长）。
+     * 把熔断也报成 502，就等于在网关已经开始自我保护的时候，
+     * 还在用状态码鼓励客户端加速重试。
+     *
+     * <p><b>{@link WebClientException} 那一条是 F1 补上的，它修的是一个既有缺陷</b>：
+     * {@code WebClientException} 继承 {@code NestedRuntimeException}，既不是
+     * {@code IllegalStateException} 也不是 {@code IllegalArgumentException}，
+     * 于是<b>上游任何非 2xx 响应都会落到最后一行变成 500</b> ——
+     * 客户端会看到"网关自己崩了"，而实际问题出在下游。
+     * 这个缺陷一直在，只是 F1 之前网关从不重试、上游一次 500 就直接穿过去，
+     * 没人深究过状态码。重试把它变成了主路径（重试耗尽后必然落在这里），
+     * 才由 scripts/check-resilience.py 的断言抓出来。
+     *
+     * <p>覆盖范围：连接被拒 / DNS 失败 / TLS 失败（{@code WebClientRequestException}）
+     * 与上游返回非 2xx（{@code WebClientResponseException}）—— 两者都是
+     * "网关的<b>下游</b>没能给出可用答案"，语义上都是 502。
+     * 注意这里刻意<b>不透传</b>上游的原始状态码（例如上游 429 不会变成网关 429）：
+     * 我们的 429 有明确含义（本租户配额用尽），混进上游的限流会让客户端
+     * 分不清该找谁，见 README 的已知边界。
+     *
+     * <p>判断顺序在三处不可颠倒：
+     * ① 熔断必须在 IllegalStateException <b>之前</b>判 —— 不过 UpstreamCircuitOpenException
+     *    继承的是 RuntimeException（不是 IllegalStateException），所以这条顺序目前
+     *    靠继承关系而不是靠顺序保证，写成显式判断是为了不依赖那个隐含前提。
      */
     public static HttpStatus statusOf(Throwable e) {
         if (e instanceof QuotaExceededException) {
             return HttpStatus.TOO_MANY_REQUESTS;
+        }
+        if (e instanceof UpstreamCircuitOpenException) {
+            return HttpStatus.SERVICE_UNAVAILABLE;
+        }
+        if (e instanceof WebClientException) {
+            return HttpStatus.BAD_GATEWAY;
         }
         if (e instanceof IllegalArgumentException) {
             return HttpStatus.BAD_REQUEST;
@@ -202,6 +240,17 @@ public final class OpenAiProtocol {
     private static String errorTypeOf(Throwable e) {
         if (e instanceof QuotaExceededException) {
             return "rate_limit_exceeded";
+        }
+        if (e instanceof UpstreamCircuitOpenException) {
+            // 独立类型而不是复用 upstream_error：客户端据此区分"上游答错了(502)"
+            // 与"网关主动熔断(503)"，两者的退避策略不同。
+            return "circuit_open";
+        }
+        if (e instanceof WebClientException) {
+            // 上游出网异常统一归到 upstream_error —— 与 statusOf 的 502 配对。
+            // 显式写出来而不是靠兜底：这两处必须成对演进，分开写在两个地方
+            // 却都不写，将来改一个忘一个是最容易发生的事。
+            return "upstream_error";
         }
         if (e instanceof IllegalArgumentException) {
             return "invalid_request_error";

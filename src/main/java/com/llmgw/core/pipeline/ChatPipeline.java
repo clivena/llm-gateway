@@ -7,6 +7,8 @@ import com.llmgw.config.GatewayProperties;
 import com.llmgw.core.cache.SemanticCacheService;
 import com.llmgw.core.cost.CostLedgerService;
 import com.llmgw.core.protocol.ProviderAdapter;
+import com.llmgw.core.protocol.ProviderRegistry;
+import com.llmgw.core.protocol.StreamChunk;
 import com.llmgw.core.quota.QuotaExceededException;
 import com.llmgw.core.quota.QuotaService;
 import com.llmgw.core.router.ModelTier;
@@ -20,7 +22,6 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
-import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -28,16 +29,17 @@ import java.util.concurrent.atomic.AtomicReference;
  * 一次请求的编排：配额 → 语义缓存 → 路由 → 上游 → 级联/降级 → 落账。
  * 流式路径与非流式路径共用前置步骤，差异只在最后一步的返回形态。
  *
- * 线程模型（真机联调踩出来的，很关键）：
- *   ① 上游适配器与缓存实现都是「同步阻塞」风格（WebClient.block / Redis block），
- *      而 WebFlux 的 Controller 直接在 Netty 事件循环线程上订阅本管线。
- *      在事件循环线程上做阻塞调用，Reactor 会抛：
- *         block()/blockFirst()/blockLast() are blocking, which is not supported in thread reactor-http-nio-N
- *      => 阻塞调用一律 subscribeOn(Schedulers.boundedElastic())。
- *   ② 落账与写缓存是"边缘副作用"，绝不能出现在响应路径上：
- *      KafkaTemplate.send() 在 broker 不可达时会阻塞到 max.block.ms（默认 60s）才返回，
- *      实测把 62s 全耗在这里（表面看是"异步发送"，实际拖死了响应）。
- *      => 一律丢到独立线程 fire-and-forget，缓存命中分支也不例外。
+ * 线程模型（P1 响应式化后）：
+ *   全链路不阻塞事件循环线程。上游调用（OpenAiAdapter）与缓存
+ *   （RedisSemanticCacheService）都返回 Mono/Flux，直接在当前链上组合，
+ *   不再需要 subscribeOn(boundedElastic) 兜底 —— 那是旧实现为掩盖 .block()
+ *   打的补丁，代价是并发上限被弹性线程池大小（默认 10 × CPU 核数）锁死，
+ *   且客户端断开后上游请求不会被取消。
+ *
+ *   唯一的例外是 recordAsync：它调用的 CostLedgerService.record 内部会执行
+ *   KafkaTemplate.send()，而该调用在 broker 不可达时会阻塞到 max.block.ms
+ *   （已压到 500ms）。这不是"兜住整条链路"，而是把一个**已知会阻塞的边缘操作**
+ *   隔离到独立线程，主链路不等待它。
  *
  * 三条不变量（都是被线上问题换回来的，改代码时别破坏）：
  *   A. 落账只能走 recordAsync —— 任何一次同步 ledger.record 都可能把响应拖住。
@@ -52,7 +54,7 @@ public class ChatPipeline {
     private final QuotaService quotaService;
     private final SemanticCacheService cacheService;
     private final RouterService routerService;
-    private final List<ProviderAdapter> adapters;
+    private final ProviderRegistry providers;
     private final CostLedgerService ledger;
     private final GatewayMetrics metrics;
     private final GatewayProperties properties;
@@ -60,20 +62,25 @@ public class ChatPipeline {
     public ChatPipeline(QuotaService quotaService,
                         SemanticCacheService cacheService,
                         RouterService routerService,
-                        List<ProviderAdapter> adapters,
+                        ProviderRegistry providers,
                         CostLedgerService ledger,
                         GatewayMetrics metrics,
                         GatewayProperties properties) {
         this.quotaService = quotaService;
         this.cacheService = cacheService;
         this.routerService = routerService;
-        this.adapters = adapters;
+        this.providers = providers;
         this.ledger = ledger;
         this.metrics = metrics;
         this.properties = properties;
     }
 
     public Mono<ChatResponse> execute(String apiKey, ChatRequest request, String traceId) {
+        if (request.messages() == null || request.messages().isEmpty()) {
+            // 显式校验而不是靠 Bean Validation：错误能沿现有链路变成 OpenAI 形状的 400，
+            // 不需要再引入一层 @ControllerAdvice 来接管异常（见 README 的取舍说明）。
+            return Mono.error(new IllegalArgumentException("messages 不能为空"));
+        }
         String question = questionOf(request);
         long estimatedTokens = Math.max(1, question.length() / 4);
         long start = System.currentTimeMillis();
@@ -87,22 +94,18 @@ public class ChatPipeline {
                     if (!allowed) {
                         return Mono.error(new QuotaExceededException(apiKey));
                     }
-                    // 缓存查询内部会 block（embedding HTTP + Redis），必须离开事件循环线程
-                    return Mono.fromCallable(() -> cacheService.lookup(namespace, question))
-                            .subscribeOn(Schedulers.boundedElastic())
-                            .flatMap(opt -> Mono.justOrEmpty(opt))
+                    // 缓存查询自身非阻塞：embedding 与 Redis 都走响应式客户端
+                    return cacheService.lookup(namespace, question)
                             .flatMap(hit -> {
                                 metrics.onCacheHit();
                                 long latency = System.currentTimeMillis() - start;
+                                ChatResponse payload = new ChatResponse("cache", "cache", hit.answer(),
+                                        new Usage(0, 0), true);
                                 // 不变量 A：命中同样要落账，但必须异步。
                                 // 旧实现这里是同步 ledger.record —— 命中本来是最快的路径，
                                 // 却在 Kafka 不可达时白等 max.block.ms，把优化点变成新瓶颈。
-                                recordAsync(traceId, apiKey, request,
-                                        new ChatResponse("cache", "cache", hit.answer(),
-                                                new Usage(0, 0), true),
-                                        0.0, latency);
-                                return Mono.just(new ChatResponse("cache", "cache", hit.answer(),
-                                        new Usage(0, 0), true));
+                                recordAsync(traceId, apiKey, request, payload, 0.0, latency);
+                                return Mono.just(payload);
                             })
                             .switchIfEmpty(Mono.defer(() -> {
                                 metrics.onCacheMiss();
@@ -111,7 +114,10 @@ public class ChatPipeline {
                 });
     }
 
-    public Flux<String> executeStream(String apiKey, ChatRequest request, String traceId) {
+    public Flux<StreamChunk> executeStream(String apiKey, ChatRequest request, String traceId) {
+        if (request.messages() == null || request.messages().isEmpty()) {
+            return Flux.error(new IllegalArgumentException("messages 不能为空"));
+        }
         String question = questionOf(request);
         long estimatedTokens = Math.max(1, question.length() / 4);
         ModelTier tier = resolveTier(request);
@@ -122,16 +128,15 @@ public class ChatPipeline {
                     if (!allowed) {
                         return Flux.error(new QuotaExceededException(apiKey));
                     }
-                    return Mono.fromCallable(() -> cacheService.lookup(namespace, question))
-                            .subscribeOn(Schedulers.boundedElastic())
-                            .flatMap(opt -> Mono.justOrEmpty(opt))
+                    return cacheService.lookup(namespace, question)
                             .flatMapMany(hit -> {
                                 metrics.onCacheHit();
                                 recordAsync(traceId, apiKey, request,
                                         new ChatResponse("cache", "cache", hit.answer(),
                                                 new Usage(0, 0), true),
                                         0.0, 0);
-                                return Flux.just(hit.answer());
+                                // 模型名标记为 cache：客户端能从分片里看出这次没走上游。
+                                return Flux.just(StreamChunk.delta("cache", hit.answer()));
                             })
                             .switchIfEmpty(Flux.defer(() -> {
                                 // 非流式分支里有 onCacheMiss，流式分支曾经漏了 ——
@@ -144,11 +149,10 @@ public class ChatPipeline {
 
     private Mono<ChatResponse> dispatch(String apiKey, ChatRequest request, String question,
                                          ModelTier tier, long start, String traceId) {
-        ProviderAdapter adapter = adapterFor(tier.model());
+        ProviderAdapter adapter = providers.forModel(tier.model());
         long begin = System.currentTimeMillis();
 
-        return Mono.fromCallable(() -> adapter.chat(tier.model(), request))
-                .subscribeOn(Schedulers.boundedElastic())
+        return adapter.chat(tier.model(), request)
                 .flatMap(response -> {
                     boolean formatValid = response.content() != null && !response.content().isBlank();
                     if (routerService.shouldEscalate(tier, response.content(), formatValid)) {
@@ -164,10 +168,10 @@ public class ChatPipeline {
                                 System.currentTimeMillis() - start);
 
                         ModelTier stronger = routerService.escalateFrom(tier);
-                        ProviderAdapter strongAdapter = adapterFor(stronger.model());
-                        ChatResponse upgraded = strongAdapter.chat(stronger.model(), request);
-                        return Mono.just(new ChatResponse(upgraded.id(), stronger.model(),
-                                upgraded.content(), upgraded.usage(), false));
+                        ProviderAdapter strongAdapter = providers.forModel(stronger.model());
+                        return strongAdapter.chat(stronger.model(), request)
+                                .map(upgraded -> new ChatResponse(upgraded.id(), stronger.model(),
+                                        upgraded.content(), upgraded.usage(), false));
                     }
                     return Mono.just(response);
                 })
@@ -179,48 +183,64 @@ public class ChatPipeline {
                     if (!response.cacheHit()) {
                         // 不变量 B：缓存段按"实际服务的模型"划，不用请求档位划，
                         // 否则升级后的高质量答案会被写进便宜模型的段里、被后续低价请求复用。
-                        writeCacheAsync(cacheNamespace(apiKey, response.model()),
+                        writeCache(cacheNamespace(apiKey, response.model()),
                                 question, response.content());
                     }
                 });
     }
 
-    private Flux<String> streamDispatch(String apiKey, ChatRequest request, String question,
-                                         ModelTier tier, String traceId) {
-        ProviderAdapter cheap = adapterFor(tier.model());
+    private Flux<StreamChunk> streamDispatch(String apiKey, ChatRequest request, String question,
+                                              ModelTier tier, String traceId) {
+        ProviderAdapter cheap = providers.forModel(tier.model());
         AtomicBoolean emitted = new AtomicBoolean(false);
-        // 级联升级后实际服务的是更强的模型，账本必须记真实模型名，
-        // 否则会出现"按便宜模型计价"的归因错误。
+        // 级联升级后实际服务的是更强的模型，账本与响应分片都必须记真实模型名，
+        // 否则会出现"按便宜模型计价"的归因错误、以及客户端看到错的模型。
         AtomicReference<String> servedBy = new AtomicReference<>(tier.model());
+        // 上游末帧的真实用量。拿不到时才回退估算（F4）。
+        AtomicReference<Usage> upstreamUsage = new AtomicReference<>();
         StringBuilder collected = new StringBuilder();
         long start = System.currentTimeMillis();
 
-        Flux<String> primary = cheap.chatStream(tier.model(), request)
-                .doOnNext(chunk -> {
-                    emitted.set(true);
-                    collected.append(chunk);
-                });
+        Flux<StreamChunk> primary = cheap.chatStream(tier.model(), request)
+                .doOnNext(chunk -> collect(chunk, emitted, collected, upstreamUsage));
 
         return primary
                 // 已输出内容后不再切换模型，避免用户看到两段拼接的答案
                 .onErrorResume(e -> emitted.get()
-                        ? Flux.<String>error(e)
+                        ? Flux.<StreamChunk>error(e)
                         : Flux.defer(() -> {
                             metrics.onEscalate();
                             ModelTier stronger = routerService.escalateFrom(tier);
                             servedBy.set(stronger.model());
-                            return adapterFor(stronger.model()).chatStream(stronger.model(), request)
-                                    .doOnNext(collected::append);
+                            return providers.forModel(stronger.model())
+                                    .chatStream(stronger.model(), request)
+                                    .doOnNext(chunk -> collect(chunk, emitted, collected, upstreamUsage));
                         }))
                 .doOnComplete(() -> {
                     long latency = System.currentTimeMillis() - start;
-                    Usage usage = new Usage(question.length() / 4, collected.length() / 4);
                     String model = servedBy.get();
+                    // 优先用上游真实 usage；缺失才回退估算。回退值不冒充真实值，
+                    // 这一点写在 README 的「已知边界」里。
+                    Usage usage = upstreamUsage.get() != null
+                            ? upstreamUsage.get()
+                            : new Usage(question.length() / 4, collected.length() / 4);
                     ChatResponse snapshot = new ChatResponse("stream", model, collected.toString(), usage, false);
                     recordAsync(traceId, apiKey, request, snapshot,
                             estimateCost(model, tier, usage), latency);
-                    writeCacheAsync(cacheNamespace(apiKey, model), question, collected.toString());
+                    writeCache(cacheNamespace(apiKey, model), question, collected.toString());
                 });
+    }
+
+    /** 累积一条上游分片：文本进缓冲，用量进引用。用量帧不影响 emitted（它没有内容）。 */
+    private static void collect(StreamChunk chunk, AtomicBoolean emitted,
+                                StringBuilder collected, AtomicReference<Usage> upstreamUsage) {
+        if (chunk.hasDelta()) {
+            emitted.set(true);
+            collected.append(chunk.delta());
+        }
+        if (chunk.usage() != null) {
+            upstreamUsage.set(chunk.usage());
+        }
     }
 
     private ModelTier resolveTier(ChatRequest request) {
@@ -241,13 +261,6 @@ public class ChatPipeline {
         return apiKey + ":" + model;
     }
 
-    private ProviderAdapter adapterFor(String model) {
-        return adapters.stream()
-                .filter(a -> a.supports(model))
-                .findFirst()
-                .orElseThrow(() -> new IllegalStateException("no adapter for model " + model));
-    }
-
     private double estimateCost(String model, ModelTier tier, Usage usage) {
         // 优先用配置的真实单价（输入/输出分开计）——否则账本会全是 0，
         // 成本归因就成了空话。没有配单价的模型才回退到 ModelTier 的粗略估算。
@@ -262,6 +275,10 @@ public class ChatPipeline {
      * 落账必须在响应路径之外。KafkaTemplate.send() 不是"立即返回"的：
      * broker 不可达时会阻塞到 max.block.ms 才抛 TimeoutException。
      * 双保险：① 本方法丢到独立线程；② application.yml 里把 max.block.ms 压到 500ms。
+     *
+     * 注意这是全链路里**唯一**保留 subscribeOn 的地方，且理由与前几处不同：
+     * 不是因为"整条链路是阻塞的"，而是因为 CostLedgerService.record 内部
+     * 有一次已知会阻塞的 Kafka 调用，需要把它隔离出去。
      */
     private void recordAsync(String traceId, String apiKey, ChatRequest request, ChatResponse response,
                              double cost, long latencyMs) {
@@ -273,15 +290,15 @@ public class ChatPipeline {
     }
 
     /**
-     * 缓存写入同样是阻塞的（embedding 走 HTTP），丢到弹性线程池异步执行。
-     * 写缓存失败不能影响用户已经拿到的回答，所以只记 debug 日志。
+     * 缓存写入是 fire-and-forget：写失败不能影响用户已经拿到的回答。
+     * P1 之后 write 本身返回 Mono（内部不再 block），所以这里直接订阅即可，
+     * 不再需要 subscribeOn —— 它是响应式链，在哪个线程订阅都不阻塞。
      */
-    private void writeCacheAsync(String namespace, String question, String answer) {
+    private void writeCache(String namespace, String question, String answer) {
         if (!properties.getCache().isEnabled() || answer == null || answer.isBlank()) {
             return;
         }
-        Mono.fromRunnable(() -> cacheService.write(namespace, question, answer))
-                .subscribeOn(Schedulers.boundedElastic())
+        cacheService.write(namespace, question, answer)
                 .subscribe(null, e -> log.debug("cache write failed: {}", e.getMessage()));
     }
 

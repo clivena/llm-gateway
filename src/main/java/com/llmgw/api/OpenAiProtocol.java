@@ -92,6 +92,21 @@ public final class OpenAiProtocol {
         return body;
     }
 
+    /**
+     * 纯用量分片。对应上游在 include_usage=true 时回的那一帧：
+     * choices 是**空数组**、usage 非空。
+     *
+     * 为什么单独一个方法而不是复用 chatCompletionChunk：后者会塞一个
+     * delta.content="" 的 choices 进来。空 delta 分片在部分客户端上会被当成
+     * "又收到一段空回复"，而正确的形状恰恰是没有任何 choices。
+     */
+    public static Map<String, Object> chatCompletionUsageChunk(String id, String model, Usage usage) {
+        Map<String, Object> body = envelope(id, OBJECT_CHUNK, model);
+        body.put("choices", new ArrayList<>());
+        body.put("usage", usageNode(usage));
+        return body;
+    }
+
     /** GET /v1/models 的响应体。 */
     public static Map<String, Object> modelsBody(List<String> modelIds) {
         List<Map<String, Object>> data = new ArrayList<>();
@@ -116,13 +131,22 @@ public final class OpenAiProtocol {
     /**
      * 异常 → HTTP 状态码。客户端靠状态码决定"退避还是重试"，
      * 把所有错误都写成 200 会让退避逻辑无从下手。
-     *   - 配额超额     → 429（客户端应退避）
-     *   - 上游/适配异常 → 502（网关下游的问题）
-     *   - 其他         → 500
+     *
+     * 判断顺序有意义：把"请求不合法"和"上游挂了"分开是这里唯一容易做错的决定。
+     * 旧实现只有 IllegalStateException → 502 一条，于是 messages 为空、model 不在
+     * 服务范围这类**调用方错误**全部被报成 502，客户端会误以为是网关侧故障去退避重试，
+     * 而重试一万次结果都一样。
+     *   - IllegalArgumentException → 400：错在调用方（messages 为空、model 不在服务范围）
+     *   - 配额超额              → 429：客户端应退避
+     *   - IllegalStateException → 502：网关下游的问题（上游报错、空响应体）
+     *   - 其他                  → 500
      */
     public static HttpStatus statusOf(Throwable e) {
         if (e instanceof QuotaExceededException) {
             return HttpStatus.TOO_MANY_REQUESTS;
+        }
+        if (e instanceof IllegalArgumentException) {
+            return HttpStatus.BAD_REQUEST;
         }
         if (e instanceof IllegalStateException) {
             return HttpStatus.BAD_GATEWAY;
@@ -134,10 +158,20 @@ public final class OpenAiProtocol {
     public static Map<String, Object> errorPayload(Throwable e) {
         Map<String, Object> error = new LinkedHashMap<>();
         error.put("message", String.valueOf(e.getMessage()));
-        error.put("type", e instanceof QuotaExceededException ? "rate_limit_exceeded" : "upstream_error");
+        error.put("type", errorTypeOf(e));
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("error", error);
         return body;
+    }
+
+    private static String errorTypeOf(Throwable e) {
+        if (e instanceof QuotaExceededException) {
+            return "rate_limit_exceeded";
+        }
+        if (e instanceof IllegalArgumentException) {
+            return "invalid_request_error";
+        }
+        return "upstream_error";
     }
 
     // --- 内部 ---

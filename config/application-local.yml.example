@@ -3,9 +3,25 @@
 
 gateway:
   cache:
-    enabled: false          # DeepSeek 无 embedding 接口，先关闭语义缓存
+    enabled: false          # 上游无 embedding 接口时缓存自动失效，这里显式关掉
+  router:
+    # model=auto 的候选表。模型名必须与下面 models 一致，否则启动时会直接报错。
+    # 只想用固定模型时，把 policy 保持原样、请求里显式传 model 即可绕开这张表。
+    policy: COST_FIRST
+    candidates:
+      - model: deepseek-flash
+        tier: CHEAP
+        cost-per-1k: 0.0015
+        quality-score: 0.72
+      - model: deepseek-v4-pro
+        tier: STRONG
+        cost-per-1k: 0.0080
+        quality-score: 0.90
   providers:
-    - name: openai          # 必须叫 openai（OpenAI 兼容协议标识）
+    # name 是**供应商标识**（用于日志与成本归因），不是协议标识 ——
+    # 所有 provider 目前都走 OpenAI 兼容协议，所以写真实厂商名即可。
+    # 加第二家会自动多出一个适配器（见 ProviderRegistry），无需改代码。
+    - name: deepseek
       base-url: https://api.deepseek.com/v1
       api-key: "sk-替换成你自己的key"
       embedding-model: ""

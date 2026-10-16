@@ -21,7 +21,7 @@ import java.util.Set;
  * **{@code POST /v1/embeddings} 刻意没有实现**，原因不是漏了：
  * 当前上游（DeepSeek）没有 embeddings 端点（实测 HTTP 404），
  * 实现出来也只会是一个必然失败的转发。语义缓存因此在配置层关着。
- * 这条边界写在 README 与 docs/step-19 里，不在代码里假装支持。
+ * 这条边界写在 README 的「已知边界」里，不在代码里假装支持。
  */
 @RestController
 @RequestMapping("/v1")

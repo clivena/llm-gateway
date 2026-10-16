@@ -125,6 +125,31 @@ class OpenAiProtocolTest {
         assertEquals("[DONE]", OpenAiProtocol.DONE);
     }
 
+    @Test
+    void usageChunkHasEmptyChoicesAndSnakeCaseUsage() throws Exception {
+        // include_usage 那一帧的形状：choices 是空数组，usage 非空。
+        // 空数组不能写成"含一个空 delta 的 choice"—— 客户端会当成又收到一段空回复。
+        JsonNode node = json(OpenAiProtocol.chatCompletionUsageChunk(
+                "cid", "deepseek-flash", new Usage(7, 9)));
+
+        assertEquals("chat.completion.chunk", node.get("object").asText());
+        assertEquals("deepseek-flash", node.get("model").asText());
+        assertTrue(node.get("choices").isArray(), "choices 必须是数组");
+        assertEquals(0, node.get("choices").size(), "用量帧的 choices 必须为空");
+        assertEquals(7, node.get("usage").get("prompt_tokens").asInt());
+        assertEquals(9, node.get("usage").get("completion_tokens").asInt());
+        assertEquals(16, node.get("usage").get("total_tokens").asInt());
+    }
+
+    @Test
+    void usageChunkCarriesNoDeltaNode() throws Exception {
+        // delta 一旦出现，客户端就会把它当成文本分片去追加。
+        JsonNode node = json(OpenAiProtocol.chatCompletionUsageChunk(
+                "cid", "m", new Usage(1, 1)));
+
+        assertFalse(node.has("delta"));
+    }
+
     // --- 错误 ---
 
     @Test
@@ -148,6 +173,19 @@ class OpenAiProtocolTest {
     void unexpectedErrorMapsTo500() {
         assertEquals(HttpStatus.INTERNAL_SERVER_ERROR,
                 OpenAiProtocol.statusOf(new RuntimeException("boom")));
+    }
+
+    @Test
+    void badRequestMapsTo400Not502() throws Exception {
+        // 回归点：messages 为空、model 不在服务范围都属于**调用方**错误。
+        // 旧实现把它报成 502，客户端会误判为网关故障去退避重试，而重试永远没用。
+        IllegalArgumentException e = new IllegalArgumentException("messages 不能为空");
+
+        assertEquals(HttpStatus.BAD_REQUEST, OpenAiProtocol.statusOf(e));
+
+        JsonNode node = json(OpenAiProtocol.errorPayload(e));
+        assertEquals("invalid_request_error", node.get("error").get("type").asText(),
+                "400 必须配 invalid_request_error，否则客户端按 type 分流还是错的");
     }
 
     @Test

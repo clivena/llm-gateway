@@ -46,6 +46,19 @@ gateway:
     period-ttl-seconds: 3024000
   router:
     policy: COST_FIRST
+    # ★ model=auto 用的候选表。模型名必须与下面 providers[].models 完全一致，
+    #   否则应用**启动时**就会报错（见 RouterService 的启动校验）——
+    #   这正是为了避免"候选表与实际部署的模型各说各话、auto 请求全部 502"。
+    #   cost-per-1k 与 pricing 同口径（元 / 1K tokens），仅在模型没配 pricing 时兜底。
+    candidates:
+      - model: gpt-4o-mini
+        tier: CHEAP
+        cost-per-1k: 0.0030
+        quality-score: 0.72
+      - model: gpt-4o
+        tier: STRONG
+        cost-per-1k: 0.0600
+        quality-score: 0.90
   # 计费单价（元 / 1K tokens）。★ 示例值，请按你自己的实际账单口径替换。
   # 没有配置单价的模型，会回退到 ModelTier.costPer1k 按总 token 估算。
   pricing:

@@ -318,13 +318,17 @@ def do_nonstream(model, step, note):
 def do_stream():
     log()
     log("=" * 72)
-    log("Step 4 · 流式请求（SSE，验证逐字吐）")
+    log("Step 4 · 流式请求（SSE，验证逐字吐 + 真实用量）")
     log("=" * 72)
     payload = {
         "model": MODEL_FLASH,
         "stream": True,
         "temperature": 0.2,
         "feature": "stream-smoke",
+        # 显式索取用量帧：网关**总是**向上游要 usage（记账要用），
+        # 但只在客户端开口时才转发给它。这里开口，是为了能当场验证
+        # 流式账本用的是上游真实 token 而不是按字符数估算。
+        "stream_options": {"include_usage": True},
         "messages": [{"role": "user", "content": "从1数到5，每个数字之间用空格分隔。"}],
     }
     log("  请求体: %s" % json.dumps(payload, ensure_ascii=False))
@@ -338,6 +342,8 @@ def do_stream():
         deltas = []
         seen_done = False
         first_at = None
+        usage_frames = []
+        chunk_models = set()
         for raw in resp:
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
             if not line:
@@ -356,6 +362,14 @@ def do_stream():
                     node = json.loads(payload_text)
                     choices = node.get("choices") or []
                     delta = (choices[0].get("delta") or {}).get("content") if choices else None
+                    # F5：分片里的 model 必须是**实际服务**的模型，不是请求里写的那个。
+                    # 级联升级或缓存命中时两者不同，这里把出现过的模型名都收集起来。
+                    if node.get("model"):
+                        chunk_models.add(node["model"])
+                    # 用量帧的形状是 choices 为空数组 + usage 非空。它没有 delta，
+                    # 所以不算文本分片；误把它当分片会让"文本分片数"虚高。
+                    if not choices and node.get("usage"):
+                        usage_frames.append(node["usage"])
                 except Exception:
                     delta = None
                 if delta:
@@ -367,6 +381,13 @@ def do_stream():
         log("  SSE 帧数 : %d（含终止帧）" % len(chunks))
         log("  文本分片 : %d" % len(deltas))
         log("  终止帧   : %s" % ("已收到 [DONE]" if seen_done else "!! 未收到 [DONE]"))
+        log("  分片模型 : %s" % (", ".join(sorted(chunk_models)) or "!! 分片里没有 model 字段"))
+        if usage_frames:
+            u = usage_frames[-1]
+            log("  真实用量 : prompt=%s completion=%s total=%s  ← 上游回传，非估算"
+                % (u.get("prompt_tokens"), u.get("completion_tokens"), u.get("total_tokens")))
+        else:
+            log("  真实用量 : !! 未收到用量帧（账本会退回按字符数估算）")
         log("  首字延迟 : %.0f ms" % ttfb)
         log("  总耗时   : %.0f ms" % total_ms)
         if deltas:

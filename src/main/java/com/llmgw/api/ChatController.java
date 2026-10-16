@@ -3,6 +3,7 @@ package com.llmgw.api;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.llmgw.api.dto.ChatRequest;
 import com.llmgw.core.pipeline.ChatPipeline;
+import com.llmgw.core.protocol.StreamChunk;
 import com.llmgw.observability.TraceIdFilter;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpStatus;
@@ -16,6 +17,7 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.SynchronousSink;
 
 import java.nio.charset.StandardCharsets;
 
@@ -29,9 +31,10 @@ import java.nio.charset.StandardCharsets;
  *
  * 错误状态码约定（旧实现把所有错误都写成 HTTP 200 + 响应体里的 error 字段，
  * 客户端没法用状态码做退避决策，也不符合 OpenAI 兼容协议）：
- *   - 配额超额     → 429 Too Many Requests
- *   - 上游/适配异常 → 502 Bad Gateway
- *   - 其他         → 500
+ *   - 配额超额       → 429 Too Many Requests
+ *   - 请求参数不合法  → 400 Bad Request
+ *   - 上游/适配异常   → 502 Bad Gateway
+ *   - 其他           → 500
  */
 @RestController
 @RequestMapping("/v1")
@@ -62,7 +65,7 @@ public class ChatController {
         String traceId = (String) exchange.getAttributes().get(TraceIdFilter.HEADER);
 
         if (request.isStream()) {
-            return stream(key, request, traceId, response, exchange);
+            return stream(key, request, traceId, response);
         }
         return complete(key, request, traceId, response);
     }
@@ -89,7 +92,7 @@ public class ChatController {
     }
 
     private Mono<Void> stream(String key, ChatRequest request, String traceId,
-                              ServerHttpResponse response, ServerWebExchange exchange) {
+                              ServerHttpResponse response) {
         response.getHeaders().setContentType(MediaType.TEXT_EVENT_STREAM);
         response.getHeaders().set("X-Accel-Buffering", "no");
         response.setStatusCode(HttpStatus.OK);
@@ -97,19 +100,35 @@ public class ChatController {
         // 分片 id 在整条流里保持一致：OpenAI 客户端按它把分片归到同一次回复。
         // 用 traceId 派生，客户端可以拿它去账本对账。
         String chunkId = "chatcmpl-" + traceId;
-        // 已知不精确：分片里的 model 只能是**请求的**模型名。
-        // 级联升级后实际服务的是更强的模型，但 ChatPipeline.executeStream 目前
-        // 只吐文本、不吐实际模型名，所以在流式路径上拿不到真实值。
-        // 要修得先改 executeStream 的返回契约（吐 (model, chunk) 结构），
-        // 那是另一个改动，这里如实留一个已知缺口而不是假装准确。
-        String model = request.resolvedModel();
+
+        // 客户端是否显式要了用量帧。网关自己**总是**向上游索取 usage（记账要用，
+        // 见 OpenAiAdapter.body 的 stream_options），但只有客户端开口了才回给它：
+        // 默认多回一个分片会让不认识的客户端多走一次解析分支。
+        boolean clientWantsUsage = request.streamOptions() != null
+                && Boolean.TRUE.equals(request.streamOptions().includeUsage());
 
         // toSseFrame 只接受已序列化的字符串，调用点必须自己 asJson ——
         // 这是刻意的：DONE 帧是字面量 "[DONE]" 而不是 JSON，
         // 如果让 toSseFrame 内部统一序列化，会把它变成 data: "[DONE]"（带引号），
         // 客户端就认不出来了。
+        //
+        // 用 handle 而不是 map：分片有两种形态（文本增量 / 纯用量），
+        // 且都可能被丢弃，map 不允许返回"零个"结果。
         Flux<Flux<DataBuffer>> frames = pipeline.executeStream(key, request, traceId)
-                .map(chunk -> toSseFrame(asJson(OpenAiProtocol.chatCompletionChunk(chunkId, model, chunk))))
+                .handle((StreamChunk chunk, SynchronousSink<Flux<DataBuffer>> sink) -> {
+                    if (chunk.hasDelta()) {
+                        // model 取自分片而不是 request.resolvedModel()：
+                        // 级联升级后实际服务的是更强的模型，用请求里的模型名会让
+                        // 客户端与账本同时看到错的归属（F5）。
+                        sink.next(toSseFrame(asJson(
+                                OpenAiProtocol.chatCompletionChunk(chunkId, chunk.model(), chunk.delta()))));
+                        return;
+                    }
+                    if (chunk.usage() != null && clientWantsUsage) {
+                        sink.next(toSseFrame(asJson(
+                                OpenAiProtocol.chatCompletionUsageChunk(chunkId, chunk.model(), chunk.usage()))));
+                    }
+                })
                 // 正常收尾必须补 [DONE]：客户端靠它判断"流结束了"，
                 // 只看连接关闭会把正常结束和网络中断混为一谈。
                 .concatWith(Flux.just(toSseFrame(OpenAiProtocol.DONE)))

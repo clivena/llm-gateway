@@ -2,27 +2,60 @@ package com.llmgw.observability;
 
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
+
 /**
- * 关键指标：缓存命中/未命中、上游失败、级联升级、账本落库成功/失败。
- * 账本两个计数器是"钱有没有记对"的直接信号：failure 一涨就说明对账会缺数据。
+ * 关键指标。P7 补全后的全景：
+ *
+ * <pre>
+ *   llmgw.cache.hit         缓存命中（含层归属见日志）
+ *   llmgw.cache.miss        缓存未命中
+ *   llmgw.cascade.escalate  级联升级次数
+ *   llmgw.ledger.write      账本落库成功
+ *   llmgw.ledger.failure    账本落库失败   ← 一涨就说明对账会缺数据
+ *   llmgw.quota.rejected    配额拒绝（对应 429）
+ *   llmgw.request.latency   延迟直方图，tag: model / stream / outcome
+ * </pre>
+ *
+ * <h3>为什么必须补延迟指标（P7）</h3>
+ * 补之前，延迟<b>只能从 Postgres 账本里查</b>。这在两处致命：
+ * ① 账本写失败（Kafka 不可达、Postgres 抖动）时指标完全瞎掉 —— 而恰恰是
+ * 系统出问题的时候最需要看延迟；② 面板要查库才能画图，把只读面板变成了数据库负载。
+ * 计时器随进程存活（Prometheus 抓取），与账本这条异步落库链路彻底解耦。
+ *
+ * <h3>为什么区分 stream</h3>
+ * 流式与非流式的"延迟"不是同一个东西：非流式的延迟是<b>全部</b>生成时间，
+ * 流式真正决定体验的是<b>首字延迟</b>（本类记的是整体完成时间，因为首字延迟
+ * 需要在上游分片流里打点，属另一个改动）。混在一个直方图里，
+ * 两种模式的 P99 会互相污染 —— 看到 P99 变差时无法判断是哪条路径退化了。
+ *
+ * <p>基数控制：model 取值来自配置（几个到几十个），stream 是布尔，
+ * outcome 两种 —— 组合数可控，不会撑爆时序库。
  */
 @Component
 public class GatewayMetrics {
 
+    private final MeterRegistry registry;
     private final Counter cacheHit;
     private final Counter cacheMiss;
     private final Counter escalate;
     private final Counter ledgerWrite;
     private final Counter ledgerFailure;
+    private final Counter quotaRejected;
 
     public GatewayMetrics(MeterRegistry registry) {
+        this.registry = registry;
         this.cacheHit = Counter.builder("llmgw.cache.hit").register(registry);
         this.cacheMiss = Counter.builder("llmgw.cache.miss").register(registry);
         this.escalate = Counter.builder("llmgw.cascade.escalate").register(registry);
         this.ledgerWrite = Counter.builder("llmgw.ledger.write").register(registry);
         this.ledgerFailure = Counter.builder("llmgw.ledger.failure").register(registry);
+        // 配额拒绝独立计数：/admin/status 与日志里能看到，但两者都不是可告警的时序数据。
+        // "429 占比突然上升"是最该被自动发现的信号之一（要么有人在刷，要么额度设小了）。
+        this.quotaRejected = Counter.builder("llmgw.quota.rejected").register(registry);
     }
 
     public void onCacheHit() { cacheHit.increment(); }
@@ -30,4 +63,22 @@ public class GatewayMetrics {
     public void onEscalate() { escalate.increment(); }
     public void onLedgerWrite() { ledgerWrite.increment(); }
     public void onLedgerFailure() { ledgerFailure.increment(); }
+    public void onQuotaRejected() { quotaRejected.increment(); }
+
+    /**
+     * 记录一次请求的端到端耗时。
+     *
+     * @param model  实际服务的模型名；缓存命中时传 "cache"（那是快路径，
+     *               与任何模型的分布都不该混在一起）
+     * @param stream 是否流式
+     * @param millis 耗时
+     */
+    public void recordLatency(String model, boolean stream, long millis) {
+        Timer.builder("llmgw.request.latency")
+                .tag("model", model == null ? "unknown" : model)
+                .tag("stream", String.valueOf(stream))
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(registry)
+                .record(Duration.ofMillis(Math.max(0, millis)));
+    }
 }

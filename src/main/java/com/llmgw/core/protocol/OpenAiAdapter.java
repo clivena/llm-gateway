@@ -6,6 +6,7 @@ import com.llmgw.api.dto.ChatRequest;
 import com.llmgw.api.dto.ChatResponse;
 import com.llmgw.api.dto.Usage;
 import com.llmgw.config.GatewayProperties;
+import com.llmgw.core.token.TokenEstimator;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.MediaType;
 import org.springframework.http.codec.ServerSentEvent;
@@ -53,6 +54,7 @@ public class OpenAiAdapter implements ProviderAdapter {
 
     private final GatewayProperties.Provider config;
     private final WebClient webClient;
+    private final TokenEstimator tokenEstimator;
 
     /**
      * @param config  该 provider 的配置片段
@@ -60,9 +62,12 @@ public class OpenAiAdapter implements ProviderAdapter {
      *                DefaultWebClientBuilder.baseUrl() 是 mutating 的（设置字段后返回 this），
      *                多 provider 循环里直接复用会让后一次覆盖前一次，
      *                结果是所有适配器都指向同一个 base-url —— 且不会有任何报错。
+     * @param tokenEstimator 估算口径由外部统一提供，避免"每家适配器各算一套"。
      */
-    public OpenAiAdapter(GatewayProperties.Provider config, WebClient.Builder builder) {
+    public OpenAiAdapter(GatewayProperties.Provider config, WebClient.Builder builder,
+                         TokenEstimator tokenEstimator) {
         this.config = config;
+        this.tokenEstimator = tokenEstimator;
         this.webClient = builder.clone()
                 .baseUrl(config.getBaseUrl())
                 .defaultHeader("Authorization", "Bearer " + config.getApiKey())
@@ -227,10 +232,8 @@ public class OpenAiAdapter implements ProviderAdapter {
 
     @Override
     public Usage estimateUsage(String model, ChatRequest request, String answer) {
-        int prompt = request.messages().stream()
-                .mapToInt(m -> m.content() == null ? 0 : m.content().length() / 4)
-                .sum();
-        int completion = answer == null ? 0 : answer.length() / 4;
-        return new Usage(prompt, completion);
+        // 交给统一的 TokenEstimator（P5）。旧实现是 messages 的 length/4 求和 ——
+        // 英文公式 + 只看字符数，中文场景低估数倍。
+        return tokenEstimator.estimateUsage(request.messages(), answer);
     }
 }

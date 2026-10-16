@@ -1,6 +1,7 @@
 package com.llmgw.core.protocol;
 
 import com.llmgw.config.GatewayProperties;
+import com.llmgw.core.token.TokenEstimator;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.reactive.function.client.WebClient;
 
@@ -112,7 +113,9 @@ class ProviderRegistryTest {
     private static ProviderRegistry registryOf(GatewayProperties.Provider... providers) {
         GatewayProperties props = new GatewayProperties();
         props.setProviders(List.of(providers));
-        return new ProviderRegistry(props, WebClient.builder());
+        // 适配器需要 TokenEstimator 才能构造（估算口径统一由它提供）。
+        // 这里用 props 自带默认系数即可 —— 本测试只关心装配，不关心估算精度。
+        return new ProviderRegistry(props, WebClient.builder(), new TokenEstimator(props));
     }
 
     private static GatewayProperties.Provider provider(String name, String baseUrl, String... models) {

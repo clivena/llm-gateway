@@ -2,6 +2,7 @@ package com.llmgw.core.router;
 
 import com.llmgw.config.GatewayProperties;
 import com.llmgw.core.protocol.ProviderRegistry;
+import com.llmgw.core.token.TokenEstimator;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.reactive.function.client.WebClient;
 
@@ -112,7 +113,8 @@ class RouterServiceTest {
         props.getRouter().setCandidates(candidates);
         props.setProviders(List.of(provider("test-provider", "https://x.example/v1", models)));
 
-        return new RouterService(props, new ProviderRegistry(props, WebClient.builder()));
+        return new RouterService(props,
+                new ProviderRegistry(props, WebClient.builder(), new TokenEstimator(props)));
     }
 
     private static GatewayProperties.Candidate candidate(String model, String tier,

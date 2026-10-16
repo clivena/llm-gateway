@@ -1,6 +1,7 @@
 package com.llmgw.core.protocol;
 
 import com.llmgw.config.GatewayProperties;
+import com.llmgw.core.token.TokenEstimator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -33,11 +34,12 @@ public class ProviderRegistry {
     private final List<ProviderAdapter> adapters;
     private final Map<String, ProviderAdapter> byModel;
 
-    public ProviderRegistry(GatewayProperties properties, WebClient.Builder builder) {
+    public ProviderRegistry(GatewayProperties properties, WebClient.Builder builder,
+                            TokenEstimator tokenEstimator) {
         List<ProviderAdapter> built = new ArrayList<>();
         for (GatewayProperties.Provider provider : properties.getProviders()) {
             validate(provider);
-            built.add(new OpenAiAdapter(provider, builder));
+            built.add(new OpenAiAdapter(provider, builder, tokenEstimator));
         }
         this.adapters = List.copyOf(built);
 

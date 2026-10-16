@@ -6,6 +6,7 @@ import com.llmgw.config.GatewayProperties;
 import com.llmgw.core.protocol.ProviderRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.annotation.Order;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
@@ -17,7 +18,13 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * 语义缓存。
+ * L2 语义缓存：向量相似度检索，能命中"意思相同但字面不同"的问题。
+ *
+ * <p><b>它是可选的增强层，不是缓存的全部</b>（P4）。这一层依赖 embedding 能力，
+ * 而上游可能没有 {@code /embeddings} 端点（DeepSeek 实测 404）。那种情况下
+ * 本层会静默退化为"恒 MISS" —— 这正是 P4 要把它降为 L2、并在前面加上
+ * 不依赖任何外部能力的 {@link ExactCacheLayer} 的原因：
+ * 让"缓存开着却一次都没命中"变成不可能发生的事。
  *
  * 设计取舍：不依赖 RediSearch 的向量索引，改为「Redis List 存条目 + 应用内余弦计算」。
  *  - 优点：任意 Redis 都能跑，条目数量按 namespace 截断（默认 500），成本可控；
@@ -31,7 +38,8 @@ import java.util.Objects;
  *      这类问题不报错、只在数据层面留下偏差，属于最难排查的一类。
  */
 @Service
-public class RedisSemanticCacheService implements SemanticCacheService {
+@Order(2)
+public class RedisSemanticCacheService implements CacheLayer {
 
     private static final Logger log = LoggerFactory.getLogger(RedisSemanticCacheService.class);
 
@@ -51,8 +59,23 @@ public class RedisSemanticCacheService implements SemanticCacheService {
     }
 
     @Override
+    public String name() {
+        return "L2-semantic";
+    }
+
+    /**
+     * 总开关 + 本层开关都要满足。把语义层单独做成开关（而不只看总开关）的理由：
+     * 没有 embedding 能力时这层是纯粹的空转 —— 每次请求都要走一遍
+     * "遍历所有 adapter 试 embed"，全部失败才放弃。白白多一次 IO 等待。
+     * 显式关掉它比依赖"调用失败了自然会降级"更诚实。
+     */
+    private boolean enabled() {
+        return properties.getCache().isEnabled() && properties.getCache().isSemanticEnabled();
+    }
+
+    @Override
     public Mono<CacheEntry> lookup(String namespace, String question) {
-        if (!properties.getCache().isEnabled() || question.isBlank()) {
+        if (!enabled() || question == null || question.isBlank()) {
             return Mono.empty();
         }
         double threshold = properties.getCache().getSimilarityThreshold();
@@ -74,7 +97,7 @@ public class RedisSemanticCacheService implements SemanticCacheService {
 
     @Override
     public Mono<Void> write(String namespace, String question, String answer) {
-        if (!properties.getCache().isEnabled() || question.isBlank()
+        if (!enabled() || question == null || question.isBlank()
                 || answer == null || answer.isBlank()) {
             return Mono.empty();
         }

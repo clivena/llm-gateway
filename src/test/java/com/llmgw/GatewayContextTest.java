@@ -3,6 +3,8 @@ package com.llmgw;
 import com.llmgw.api.ChatController;
 import com.llmgw.api.OpenAiCompatController;
 import com.llmgw.config.GatewayProperties;
+import com.llmgw.core.cache.LayeredCacheService;
+import com.llmgw.core.cache.SemanticCacheService;
 import com.llmgw.core.pipeline.ChatPipeline;
 import com.llmgw.core.protocol.ProviderRegistry;
 import com.llmgw.core.router.RouterService;
@@ -10,6 +12,8 @@ import com.llmgw.core.router.RoutingPolicy;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -52,6 +56,9 @@ class GatewayContextTest {
 
     @Autowired
     private OpenAiCompatController compatController;
+
+    @Autowired
+    private SemanticCacheService cache;
 
     @Test
     void contextLoadsWithShippedDefaultConfig() {
@@ -103,5 +110,27 @@ class GatewayContextTest {
             assertNotNull(providers.forModel(picked),
                     "策略 " + policy + " 选出的模型 " + picked + " 必须能路由到适配器");
         }
+    }
+
+    /**
+     * 回归点（P4）：缓存层必须真的被装配进集合。
+     *
+     * 这是本轮真机验证踩出来的：缓存配置全开（exact=true）、Redis 连通、
+     * 主链路一切正常，但 Redis 里一个 {@code ex:} 键都没有 —— **缓存从未写入**。
+     * 原因就藏在 Spring 对集合注入的规则里：{@code List<T>} 没有候选 bean 时
+     * 注入的是<b>空集合而不是报错</b>。于是门面的 lookup/write 全部退化成
+     * 直接返回空 Mono，主链路毫无异常。
+     *
+     * 这条断言的价值在于把"静默失效"变成"启动即失败"：
+     * 哪天某个层漏了 @Service、或被移出组件扫描范围，这个测试会立刻红。
+     */
+    @Test
+    void cacheLayersAreWiredInPriorityOrder() {
+        assertTrue(cache instanceof LayeredCacheService,
+                "SemanticCacheService 的实现应当是门面 LayeredCacheService");
+
+        List<String> names = ((LayeredCacheService) cache).layerNames();
+        assertEquals(List.of("L1-exact", "L2-semantic"), names,
+                "缓存层装配结果不对（顺序即优先级）：实际 " + names);
     }
 }

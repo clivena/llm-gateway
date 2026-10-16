@@ -42,12 +42,39 @@ gateway:
     sink: ${COST_SINK:postgres}
   cache:
     enabled: true
+    # L1 精确缓存：规范化问题 → SHA-256 → 直接查 Redis 单值。
+    # 不依赖 embedding 能力，任何部署下都能真正命中（旧实现只有语义层，
+    # 供应商没有 /embeddings 时缓存开着却一次都不命中，属于静默失效）。
+    exact-enabled: true
+    # L2 语义缓存：向量检索，能命中"意思相同但字面不同"的问题。
+    # ★ 依赖上游的 /embeddings 能力。没有该端点的供应商（如 DeepSeek）请置 false ——
+    #   开着的话每个请求都要多走一遍"试遍所有 adapter 取向量"的失败路径。
+    semantic-enabled: true
     similarity-threshold: 0.92
     ttl-seconds: 3600
     max-entries-per-namespace: 500
   quota:
     default-limit-tokens: 200000
     period-ttl-seconds: 3024000
+  # Token 估算系数 —— 配额预扣与兜底计费共用这一套口径。
+  # ★ 这些是**实测校准值**，不是经验常数：token 数由上游的分词器决定，随供应商与
+  #   模型版本变化。当前值来自 2026-10-16 对 deepseek-flash 的真机实测
+  #   （见 scripts/calibrate-token-estimator.py）。**换供应商必须重新校准。**
+  token-estimate:
+    # 一次性固定开销：整个请求只付一次，与消息条数无关（上游套模板的固定成本）。
+    # 实测 ≈26.5 —— 对 5 字提问占 80%，是短请求的绝对主导项；对 2000 字长请求只占 2.5%。
+    # 这一项是实测挖出来的：只按"内容有多少字符"算，解释不了上游回传的 token 数
+    # （"Explain caching" 15 个 ASCII 字符 → 上游回传 32 tokens）。
+    base-overhead: 26.52
+    # 每个 CJK / 全角字符折算的 token 数（实测 ≈0.512，约 2 汉字/token）
+    cjk-per-char: 0.512
+    # 每个非 CJK 字符折算的 token 数（实测 ≈0.188，约 5.3 字符/token）
+    ascii-per-char: 0.188
+    # 每条消息在一次性开销之上再付一次的结构开销（实测 ≈1.16）
+    per-message-overhead: 1.16
+    # 全局安全系数。刻意 > 1：配额场景下低估 = 允许超支（钱漏了且不可逆），
+    # 高估 = 提前拦截。两害不对称，所以选保守方向。
+    safety-factor: 1.05
   router:
     policy: COST_FIRST
     # ★ model=auto 用的候选表。模型名必须与下面 providers[].models 完全一致，
@@ -90,3 +117,12 @@ management:
     web:
       exposure:
         include: health,info,prometheus
+
+logging:
+  pattern:
+    # %X{traceId} 从 MDC 取，没有时显示 --。
+    # ★ traceId 能被打印出来，靠的是「TraceIdFilter 写 Reactor Context →
+    #   MdcContextLifter 在每次算子回调前同步进 MDC」这条链，不是直接 MDC.put。
+    #   在 WebFlux 下直接 put 会串味（Netty 事件循环线程被多请求复用）
+    #   或丢失（处理过程跨线程），两种情况都比不打更糟。
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{traceId:--}] %logger{20} - %msg%n"

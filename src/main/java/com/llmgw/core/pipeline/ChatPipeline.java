@@ -14,6 +14,7 @@ import com.llmgw.core.quota.QuotaService;
 import com.llmgw.core.router.ModelTier;
 import com.llmgw.core.router.RouterService;
 import com.llmgw.core.router.RoutingPolicy;
+import com.llmgw.core.token.TokenEstimator;
 import com.llmgw.observability.GatewayMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -58,6 +59,7 @@ public class ChatPipeline {
     private final CostLedgerService ledger;
     private final GatewayMetrics metrics;
     private final GatewayProperties properties;
+    private final TokenEstimator tokenEstimator;
 
     public ChatPipeline(QuotaService quotaService,
                         SemanticCacheService cacheService,
@@ -65,7 +67,8 @@ public class ChatPipeline {
                         ProviderRegistry providers,
                         CostLedgerService ledger,
                         GatewayMetrics metrics,
-                        GatewayProperties properties) {
+                        GatewayProperties properties,
+                        TokenEstimator tokenEstimator) {
         this.quotaService = quotaService;
         this.cacheService = cacheService;
         this.routerService = routerService;
@@ -73,6 +76,7 @@ public class ChatPipeline {
         this.ledger = ledger;
         this.metrics = metrics;
         this.properties = properties;
+        this.tokenEstimator = tokenEstimator;
     }
 
     public Mono<ChatResponse> execute(String apiKey, ChatRequest request, String traceId) {
@@ -82,7 +86,12 @@ public class ChatPipeline {
             return Mono.error(new IllegalArgumentException("messages 不能为空"));
         }
         String question = questionOf(request);
-        long estimatedTokens = Math.max(1, question.length() / 4);
+        // 配额预扣必须覆盖**全部消息**（P5）。旧实现在这里算的是 question.length()/4，
+        // 那既用了英文公式（中文低估 6.43 倍），又只算最后一条 user 消息 ——
+        // system prompt 与多轮历史全都白用。两项叠加，配额在中文多轮场景下基本失效。
+        // 注意 questionOf 仍然只取最后一条 user 消息：那是**缓存键**的语义
+        // （用户问的"这一句"是什么），与配额预算需要的"整包多大"是两件事。
+        long estimatedTokens = tokenEstimator.estimatePrompt(request.messages());
         long start = System.currentTimeMillis();
         // 档位提前解析：缓存 namespace 需要模型维度。
         // 放在配额之前是安全的 —— RouterService.pick 是纯函数，不做 IO。
@@ -92,6 +101,7 @@ public class ChatPipeline {
         return quotaService.tryConsume(apiKey, estimatedTokens)
                 .flatMap(allowed -> {
                     if (!allowed) {
+                        metrics.onQuotaRejected();
                         return Mono.error(new QuotaExceededException(apiKey));
                     }
                     // 缓存查询自身非阻塞：embedding 与 Redis 都走响应式客户端
@@ -99,6 +109,10 @@ public class ChatPipeline {
                             .flatMap(hit -> {
                                 metrics.onCacheHit();
                                 long latency = System.currentTimeMillis() - start;
+                                // 命中路径的延迟单独记（model 标为 "cache"）：
+                                // 它本该是最快的一条路径，与任何模型的耗时混在一个分布里
+                                // 就看不出"缓存到底省了多少"—— 而那正是缓存存在的理由。
+                                metrics.recordLatency("cache", false, latency);
                                 ChatResponse payload = new ChatResponse("cache", "cache", hit.answer(),
                                         new Usage(0, 0), true);
                                 // 不变量 A：命中同样要落账，但必须异步。
@@ -119,13 +133,14 @@ public class ChatPipeline {
             return Flux.error(new IllegalArgumentException("messages 不能为空"));
         }
         String question = questionOf(request);
-        long estimatedTokens = Math.max(1, question.length() / 4);
+        long estimatedTokens = tokenEstimator.estimatePrompt(request.messages());
         ModelTier tier = resolveTier(request);
         String namespace = cacheNamespace(apiKey, tier.model());
 
         return quotaService.tryConsume(apiKey, estimatedTokens)
                 .flatMapMany(allowed -> {
                     if (!allowed) {
+                        metrics.onQuotaRejected();
                         return Flux.error(new QuotaExceededException(apiKey));
                     }
                     return cacheService.lookup(namespace, question)
@@ -178,6 +193,9 @@ public class ChatPipeline {
                 .doOnNext(response -> {
                     long latency = System.currentTimeMillis() - (start == 0 ? begin : start);
                     Usage usage = response.usage() == null ? new Usage(0, 0) : response.usage();
+                    // 延迟指标必须独立于账本：账本走的是 Kafka/Postgres 异步链路，
+                    // 那条链路挂了正是最需要看延迟的时刻 —— 记在账本里会一起瞎掉。
+                    metrics.recordLatency(response.model(), false, latency);
                     recordAsync(traceId, apiKey, request, response,
                             estimateCost(response.model(), tier, usage), latency);
                     if (!response.cacheHit()) {
@@ -219,11 +237,16 @@ public class ChatPipeline {
                 .doOnComplete(() -> {
                     long latency = System.currentTimeMillis() - start;
                     String model = servedBy.get();
+                    // stream=true 单独打标：流式的"总耗时"与非流式不是同一件事
+                    // （流式真正决定体验的是首字延迟），混在一个直方图里会互相污染 P99。
+                    metrics.recordLatency(model, true, latency);
                     // 优先用上游真实 usage；缺失才回退估算。回退值不冒充真实值，
                     // 这一点写在 README 的「已知边界」里。
+                    // 回退估算改用 TokenEstimator（P5）：/4 的英文公式对中文答案同样低估，
+                    // 而流式恰恰是中文输出的主战场。
                     Usage usage = upstreamUsage.get() != null
                             ? upstreamUsage.get()
-                            : new Usage(question.length() / 4, collected.length() / 4);
+                            : tokenEstimator.estimateUsage(request.messages(), collected.toString());
                     ChatResponse snapshot = new ChatResponse("stream", model, collected.toString(), usage, false);
                     recordAsync(traceId, apiKey, request, snapshot,
                             estimateCost(model, tier, usage), latency);
@@ -296,10 +319,19 @@ public class ChatPipeline {
      */
     private void writeCache(String namespace, String question, String answer) {
         if (!properties.getCache().isEnabled() || answer == null || answer.isBlank()) {
+            // 这个 warn 不是调试残留，而是必须保留的可观测项：
+            // "缓存开着但从不写入"是最难查的一类静默失效 —— 主链路一切正常、
+            // 日志一片干净，只有翻开 Redis 才发现一个键都没有。
+            // 把跳过的原因（哪个条件挡住的）直接写出来，是最低成本的可观测性。
+            log.warn("cache write skipped [ns={}]: cacheEnabled={} answerBlank={}",
+                    namespace, properties.getCache().isEnabled(),
+                    answer == null || answer.isBlank());
             return;
         }
         cacheService.write(namespace, question, answer)
-                .subscribe(null, e -> log.debug("cache write failed: {}", e.getMessage()));
+                .doOnSuccess(v -> log.debug("cache written [ns={}]", namespace))
+                .subscribe(null, e -> log.warn("cache write failed [ns={}]: {}",
+                        namespace, e.toString()));
     }
 
     private String questionOf(ChatRequest request) {

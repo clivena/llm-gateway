@@ -16,11 +16,11 @@
 | 12 | **真机联调**：跑通全链路并修掉 6 个问题 | [step-12](./step-12-live-integration.md) |
 | 13 | **配额实测 + 账本落库**：Lua 无超发、traceId 贯通 | [step-13](./step-13-redis-quota-ledger.md) |
 | 15 | 全量复查：修掉 5 个"静默失效"缺陷 | [step-15](./step-15-review-fixes.md) |
+| 16 | 响应式化 + 多 provider + 路由配置化 | [step-16](./step-16-reactive-multi-provider.md) |
+| 17 | **估算从"猜"变"算"** + 缓存拆两级 + MDC 贯通 | [step-17](./step-17-token-estimate-and-cache-layers.md) |
 
-> 16（响应式化 + 多 provider + 路由配置化）**尚未成篇**：
-> 代码与测试已完成，但这一批的价值主要落在真机数字上（重构后的延迟、并发、
-> 流式真实 usage），数字没跑出来之前写出来的会是一篇"设计说明"而不是"记录"。
-> 重启联调并拿到数据后补。当前状态见 [README 的已知边界](../README.md#已知边界诚实清单)。
+> 16 与 17 均已成篇。14 号步骤当时未单独成篇，内容并入 [step-15](./step-15-review-fixes.md)。
+> 当前状态与已知边界见 [README 的已知边界](../README.md#已知边界诚实清单)。
 
 ---
 

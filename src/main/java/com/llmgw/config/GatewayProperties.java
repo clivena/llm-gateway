@@ -12,6 +12,7 @@ public class GatewayProperties {
 
     private Cache cache = new Cache();
     private Quota quota = new Quota();
+    private TokenEstimate tokenEstimate = new TokenEstimate();
     private Router router = new Router();
     private Cost cost = new Cost();
     private List<Provider> providers = new ArrayList<>();
@@ -20,11 +21,26 @@ public class GatewayProperties {
 
     public static class Cache {
         private boolean enabled = true;
+        /**
+         * L1 精确缓存（规范化问题 → 哈希 → 单值）。不依赖 embedding 能力，
+         * 因此任何部署下都能工作，默认开。
+         */
+        private boolean exactEnabled = true;
+        /**
+         * L2 语义缓存（向量检索）。依赖上游的 /embeddings 能力 ——
+         * 供应商没有该端点时它会退化为恒 MISS，且每次请求还要多走一遍
+         * "试遍所有 adapter 取向量"的失败路径。没这个能力就显式关掉。
+         */
+        private boolean semanticEnabled = true;
         private double similarityThreshold = 0.92;
         private long ttlSeconds = 3600;
         private int maxEntriesPerNamespace = 500;
         public boolean isEnabled() { return enabled; }
         public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        public boolean isExactEnabled() { return exactEnabled; }
+        public void setExactEnabled(boolean v) { this.exactEnabled = v; }
+        public boolean isSemanticEnabled() { return semanticEnabled; }
+        public void setSemanticEnabled(boolean v) { this.semanticEnabled = v; }
         public double getSimilarityThreshold() { return similarityThreshold; }
         public void setSimilarityThreshold(double v) { this.similarityThreshold = v; }
         public long getTtlSeconds() { return ttlSeconds; }
@@ -40,6 +56,51 @@ public class GatewayProperties {
         public void setDefaultLimitTokens(long v) { this.defaultLimitTokens = v; }
         public long getPeriodTtlSeconds() { return periodTtlSeconds; }
         public void setPeriodTtlSeconds(long v) { this.periodTtlSeconds = v; }
+    }
+
+    /**
+     * Token 估算系数。
+     *
+     * 这几个数字不是"经验常数"，而是**实测校准值**：token 数由上有的分词器决定，
+     * 随供应商与模型版本变化。当前默认值来自 2026-10-16 对 DeepSeek 的真机实测
+     * （见 scripts/calibrate-token-estimator.py 的输出），换供应商必须重新校准。
+     */
+    public static class TokenEstimate {
+        /**
+         * <b>一次性</b>固定开销 —— 整个请求只付一次，与消息条数无关。
+         *
+         * 这一项是实测挖出来的（deepseek-flash 测得 ≈28）：只按需计费
+         * "18 个 ASCII 字符的请求"解释不了上游回传的 32 prompt_tokens，
+         * 差的那部分就是上游把请求套进自家对话模板（BOS/EOS 标记、角色分隔等）
+         * 的固定成本。
+         *
+         * 它是短请求的主导项 —— 28 token 的固定开销对一条 5 字提问来说占 85%，
+         * 忽略它会让估算在短请求上偏小数倍。反过来，对 2000 字的长请求它
+         * 只占 2.5%，可以忽略。
+         */
+        private double baseOverhead = 26.52;
+        /** 每条 CJK / 全角字符折算的 token 数。DeepSeek 实测 ≈0.512（约 2 汉字/token）。 */
+        private double cjkPerChar = 0.512;
+        /** 每个非 CJK 字符折算的 token 数。DeepSeek 实测 ≈0.188（约 5.3 字符/token）。 */
+        private double asciiPerChar = 0.188;
+        /** 每条消息的额外结构开销（在 baseOverhead 之外，每条再付一次）。实测 ≈1.16。 */
+        private double perMessageOverhead = 1.16;
+        /**
+         * 全局安全系数。刻意 > 1：配额场景下低估 = 允许超支（钱漏了），
+         * 高估 = 提前拦截。两者不对称，所以选保守方向。
+         */
+        private double safetyFactor = 1.05;
+
+        public double getBaseOverhead() { return baseOverhead; }
+        public void setBaseOverhead(double v) { this.baseOverhead = v; }
+        public double getCjkPerChar() { return cjkPerChar; }
+        public void setCjkPerChar(double v) { this.cjkPerChar = v; }
+        public double getAsciiPerChar() { return asciiPerChar; }
+        public void setAsciiPerChar(double v) { this.asciiPerChar = v; }
+        public double getPerMessageOverhead() { return perMessageOverhead; }
+        public void setPerMessageOverhead(double v) { this.perMessageOverhead = v; }
+        public double getSafetyFactor() { return safetyFactor; }
+        public void setSafetyFactor(double v) { this.safetyFactor = v; }
     }
 
     /**
@@ -140,6 +201,8 @@ public class GatewayProperties {
     public void setCache(Cache cache) { this.cache = cache; }
     public Quota getQuota() { return quota; }
     public void setQuota(Quota quota) { this.quota = quota; }
+    public TokenEstimate getTokenEstimate() { return tokenEstimate; }
+    public void setTokenEstimate(TokenEstimate v) { this.tokenEstimate = v; }
     public Router getRouter() { return router; }
     public void setRouter(Router router) { this.router = router; }
     public Cost getCost() { return cost; }

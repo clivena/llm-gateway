@@ -72,10 +72,26 @@ public class AdminController {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("pricing", prices);
         out.put("routerPolicy", properties.getRouter().getPolicy());
+        // 缓存拆成三级信息暴露：L1/L2 各自都能独立关闭（L2 在无 embedding 的供应商下
+        // 开着只是空转），面板只报一个 "cacheEnabled" 会让人误判"缓存开着=会命中"。
         out.put("cacheEnabled", properties.getCache().isEnabled());
+        out.put("cacheExactEnabled", properties.getCache().isExactEnabled());
+        out.put("cacheSemanticEnabled", properties.getCache().isSemanticEnabled());
         out.put("similarityThreshold", properties.getCache().getSimilarityThreshold());
         out.put("costSink", properties.getCost().getSink());
         out.put("quotaLimitTokens", properties.getQuota().getDefaultLimitTokens());
+
+        // 当前生效的 token 估算系数。暴露出来的理由不是"面板要展示"，
+        // 而是让校准脚本（scripts/calibrate-token-estimator.py）能读到**实际生效**的值
+        // 去校验预测精度 —— 否则脚本只能硬编码一份副本，配置一改就悄悄测错。
+        Map<String, Object> tokenEstimate = new LinkedHashMap<>();
+        tokenEstimate.put("baseOverhead", properties.getTokenEstimate().getBaseOverhead());
+        tokenEstimate.put("cjkPerChar", properties.getTokenEstimate().getCjkPerChar());
+        tokenEstimate.put("asciiPerChar", properties.getTokenEstimate().getAsciiPerChar());
+        tokenEstimate.put("perMessageOverhead",
+                properties.getTokenEstimate().getPerMessageOverhead());
+        tokenEstimate.put("safetyFactor", properties.getTokenEstimate().getSafetyFactor());
+        out.put("tokenEstimate", tokenEstimate);
         return Mono.just(out);
     }
 
@@ -97,6 +113,8 @@ public class AdminController {
             out.put("postgres", t.getT2());
             out.put("routerPolicy", properties.getRouter().getPolicy());
             out.put("cacheEnabled", properties.getCache().isEnabled());
+            out.put("cacheExactEnabled", properties.getCache().isExactEnabled());
+            out.put("cacheSemanticEnabled", properties.getCache().isSemanticEnabled());
             out.put("costSink", properties.getCost().getSink());
             out.put("quotaLimitTokens", properties.getQuota().getDefaultLimitTokens());
             return out;

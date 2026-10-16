@@ -73,6 +73,28 @@ def log(msg=""):
         pass
 
 
+def openai_fields(data, resp=None):
+    """从 OpenAI 形状的响应里取出 (回答, 模型, usage, 缓存命中)。
+
+    网关的成功响应已统一为 OpenAI 形状：
+      choices[].message.content + usage.{prompt_tokens,completion_tokens,total_tokens}
+    缓存命中走 X-Cache-Hit 响应头，不在 body 里。
+
+    以前这里读的是扁平字段（content / promptTokens / cacheHit）。那些字段已经不存在，
+    继续读不会报错、只会静默拿到 None —— 那是最难排查的一类回归，
+    所以这个函数只认新形状，读不到就明确返回 None 而不是兜底成 0。
+    """
+    choices = data.get("choices") or []
+    message = (choices[0].get("message") or {}) if choices else {}
+    answer = message.get("content")
+    usage = data.get("usage") or {}
+    cache_hit = None
+    if resp is not None:
+        headers = {k.lower(): v for k, v in resp.getheaders()}
+        cache_hit = headers.get("x-cache-hit")
+    return answer, data.get("model"), usage, cache_hit
+
+
 def flush():
     LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(LOG, "w", encoding="utf-8", errors="replace") as f:
@@ -267,19 +289,20 @@ def do_nonstream(model, step, note):
         ms = (time.time() - t0) * 1000
         log("  HTTP 状态: %s" % resp.status)
         log("  响应头   : %s" % [h for h in resp.getheaders()
-                                 if h[0].lower() in ("content-type", "x-trace-id", "x-request-id")])
+                                 if h[0].lower() in ("content-type", "x-trace-id",
+                                                     "x-request-id", "x-cache-hit")])
         log("  耗时     : %.0f ms" % ms)
         try:
             data = json.loads(raw)
             if data.get("error"):
                 log("  [上游返回错误] %s" % data.get("error"))
-            log("  回答     : %s" % data.get("content"))
-            log("  model    : %s" % data.get("model"))
-            log("  cacheHit : %s" % data.get("cacheHit"))
-            log("  usage    : %s" % data.get("usage"))
-            u = data.get("usage") or {}
-            pt = u.get("promptTokens") or 0
-            ct = u.get("completionTokens") or 0
+            answer, model, u, cache_hit = openai_fields(data, resp)
+            log("  回答     : %s" % answer)
+            log("  model    : %s" % model)
+            log("  cacheHit : %s" % cache_hit)
+            log("  usage    : %s" % u)
+            pt = u.get("prompt_tokens") or 0
+            ct = u.get("completion_tokens") or 0
             log("  => 账本按 gateway.pricing 单价计费（输入/输出分开）；"
                 "查 Postgres: docker compose exec -T postgres psql -U postgres -d llmgw -c "
                 "\"select trace_id,model,prompt_tokens,completion_tokens,cost from cost_ledger order by id desc limit 5\"")
@@ -312,6 +335,8 @@ def do_stream():
         log("  响应头   : %s" % [h for h in resp.getheaders()
                                  if h[0].lower() in ("content-type", "x-accel-buffering")])
         chunks = []
+        deltas = []
+        seen_done = False
         first_at = None
         for raw in resp:
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
@@ -320,16 +345,32 @@ def do_stream():
             if first_at is None:
                 first_at = time.time()
             if line.startswith("data: "):
-                chunks.append(line[6:])
-                if len(chunks) <= 10:
+                payload_text = line[6:]
+                chunks.append(payload_text)
+                # 流式也已经是 OpenAI chunk 信封了：增量在 choices[0].delta.content。
+                # 终止帧是字面量 [DONE]，不是 JSON，必须先判掉再解析。
+                if payload_text == "[DONE]":
+                    seen_done = True
+                    continue
+                try:
+                    node = json.loads(payload_text)
+                    choices = node.get("choices") or []
+                    delta = (choices[0].get("delta") or {}).get("content") if choices else None
+                except Exception:
+                    delta = None
+                if delta:
+                    deltas.append(delta)
+                if len(chunks) <= 6 or payload_text == "[DONE]":
                     log("    <- %s" % line)
         total_ms = (time.time() - t0) * 1000
         ttfb = (first_at - t0) * 1000 if first_at else -1
-        log("  分片数   : %d" % len(chunks))
+        log("  SSE 帧数 : %d（含终止帧）" % len(chunks))
+        log("  文本分片 : %d" % len(deltas))
+        log("  终止帧   : %s" % ("已收到 [DONE]" if seen_done else "!! 未收到 [DONE]"))
         log("  首字延迟 : %.0f ms" % ttfb)
         log("  总耗时   : %.0f ms" % total_ms)
-        if chunks:
-            log("  拼接结果 : %s" % ("".join(chunks)[:150]))
+        if deltas:
+            log("  拼接结果 : %s" % ("".join(deltas)[:150]))
         conn.close()
     except Exception as e:
         log("  [请求失败] %r" % e)

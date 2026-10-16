@@ -3,7 +3,6 @@ package com.llmgw.api;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.llmgw.api.dto.ChatRequest;
 import com.llmgw.core.pipeline.ChatPipeline;
-import com.llmgw.core.quota.QuotaExceededException;
 import com.llmgw.observability.TraceIdFilter;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpStatus;
@@ -19,12 +18,14 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.nio.charset.StandardCharsets;
-import java.util.LinkedHashMap;
-import java.util.Map;
 
 /**
  * OpenAI 兼容入口。同一个路径同时支持流式与非流式：
  * 手动写响应体，避免 Spring 因 produces 不同产生的映射歧义。
+ *
+ * 响应形状全部由 {@link OpenAiProtocol} 构造，本类只负责
+ * "取数 → 挑分支 → 写头 → 写体"。形状定义集中在协议类里，
+ * 这里不再手拼任何字段名。
  *
  * 错误状态码约定（旧实现把所有错误都写成 HTTP 200 + 响应体里的 error 字段，
  * 客户端没法用状态码做退避决策，也不符合 OpenAI 兼容协议）：
@@ -43,17 +44,11 @@ public class ChatController {
         this.pipeline = pipeline;
     }
 
-    /** 异常 → HTTP 状态码的映射。抽成静态方法是为了能单测（见 ChatControllerStatusTest）。 */
-    static HttpStatus statusOf(Throwable e) {
-        if (e instanceof QuotaExceededException) {
-            return HttpStatus.TOO_MANY_REQUESTS;
-        }
-        if (e instanceof IllegalStateException) {
-            // 上游返回错误、没有可用适配器等，都归为"网关下游的问题"
-            return HttpStatus.BAD_GATEWAY;
-        }
-        return HttpStatus.INTERNAL_SERVER_ERROR;
-    }
+    /**
+     * 异常 → HTTP 状态码的映射与错误体形状都已收归 {@link OpenAiProtocol}：
+     * 状态码和 body 必须成对演进，分开放最容易出现"改了状态码、忘了改 type"。
+     * 相应断言见 OpenAiProtocolTest（原 ChatControllerStatusTest 已并入该文件）。
+     */
 
     @PostMapping("/chat/completions")
     public Mono<Void> chat(@RequestHeader(value = "X-Api-Key", required = false) String apiKey,
@@ -67,28 +62,64 @@ public class ChatController {
         String traceId = (String) exchange.getAttributes().get(TraceIdFilter.HEADER);
 
         if (request.isStream()) {
-            response.getHeaders().setContentType(MediaType.TEXT_EVENT_STREAM);
-            response.getHeaders().set("X-Accel-Buffering", "no");
-            response.setStatusCode(HttpStatus.OK);
-            Flux<Flux<DataBuffer>> frames = pipeline.executeStream(key, request, traceId)
-                    .map(this::toSseFrame)
-                    .onErrorResume(e -> {
-                        // 首帧之前出错（配额、上游立刻拒绝）时响应还没提交，状态码还能改；
-                        // 已经吐过分片就只能靠 SSE error 帧把错误带给客户端了。
-                        setStatusIfUncommitted(response, statusOf(e));
-                        return Flux.just(toSseFrame(encodeError(e)));
-                    });
-            return response.writeAndFlushWith(frames);
+            return stream(key, request, traceId, response, exchange);
         }
+        return complete(key, request, traceId, response);
+    }
 
+    private Mono<Void> complete(String key, ChatRequest request, String traceId,
+                                ServerHttpResponse response) {
         response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
         response.setStatusCode(HttpStatus.OK);
         return pipeline.execute(key, request, traceId)
-                .flatMap(resp -> response.writeWith(Mono.fromSupplier(() -> toBuffer(response, resp))))
+                .flatMap(resp -> {
+                    // 缓存命中走响应头，不进 body —— 见 OpenAiProtocol 规则 A。
+                    // 必须在 writeWith 之前设置：首次写出后头部就冻结了。
+                    response.getHeaders().set(OpenAiProtocol.CACHE_HIT_HEADER,
+                            String.valueOf(resp.cacheHit()));
+                    Object body = OpenAiProtocol.chatCompletionBody(
+                            resp.id(), resp.model(), resp.content(), resp.usage());
+                    return response.writeWith(Mono.fromSupplier(() -> toBuffer(response, body)));
+                })
                 .onErrorResume(e -> {
-                    setStatusIfUncommitted(response, statusOf(e));
-                    return response.writeWith(Mono.fromSupplier(() -> toBuffer(response, errorPayload(e))));
+                    setStatusIfUncommitted(response, OpenAiProtocol.statusOf(e));
+                    return response.writeWith(
+                            Mono.fromSupplier(() -> toBuffer(response, OpenAiProtocol.errorPayload(e))));
                 });
+    }
+
+    private Mono<Void> stream(String key, ChatRequest request, String traceId,
+                              ServerHttpResponse response, ServerWebExchange exchange) {
+        response.getHeaders().setContentType(MediaType.TEXT_EVENT_STREAM);
+        response.getHeaders().set("X-Accel-Buffering", "no");
+        response.setStatusCode(HttpStatus.OK);
+
+        // 分片 id 在整条流里保持一致：OpenAI 客户端按它把分片归到同一次回复。
+        // 用 traceId 派生，客户端可以拿它去账本对账。
+        String chunkId = "chatcmpl-" + traceId;
+        // 已知不精确：分片里的 model 只能是**请求的**模型名。
+        // 级联升级后实际服务的是更强的模型，但 ChatPipeline.executeStream 目前
+        // 只吐文本、不吐实际模型名，所以在流式路径上拿不到真实值。
+        // 要修得先改 executeStream 的返回契约（吐 (model, chunk) 结构），
+        // 那是另一个改动，这里如实留一个已知缺口而不是假装准确。
+        String model = request.resolvedModel();
+
+        // toSseFrame 只接受已序列化的字符串，调用点必须自己 asJson ——
+        // 这是刻意的：DONE 帧是字面量 "[DONE]" 而不是 JSON，
+        // 如果让 toSseFrame 内部统一序列化，会把它变成 data: "[DONE]"（带引号），
+        // 客户端就认不出来了。
+        Flux<Flux<DataBuffer>> frames = pipeline.executeStream(key, request, traceId)
+                .map(chunk -> toSseFrame(asJson(OpenAiProtocol.chatCompletionChunk(chunkId, model, chunk))))
+                // 正常收尾必须补 [DONE]：客户端靠它判断"流结束了"，
+                // 只看连接关闭会把正常结束和网络中断混为一谈。
+                .concatWith(Flux.just(toSseFrame(OpenAiProtocol.DONE)))
+                .onErrorResume(e -> {
+                    // 首帧之前出错（配额、上游立刻拒绝）时响应还没提交，状态码还能改；
+                    // 已经吐过分片就只能靠 SSE error 帧把错误带给客户端了。
+                    setStatusIfUncommitted(response, OpenAiProtocol.statusOf(e));
+                    return Flux.just(toSseFrame(asJson(OpenAiProtocol.errorPayload(e))));
+                });
+        return response.writeAndFlushWith(frames);
     }
 
     private static void setStatusIfUncommitted(ServerHttpResponse response, HttpStatus status) {
@@ -100,29 +131,14 @@ public class ChatController {
     }
 
     private DataBuffer toBuffer(ServerHttpResponse response, Object payload) {
+        return response.bufferFactory().wrap(asJson(payload).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String asJson(Object payload) {
         try {
-            byte[] bytes = mapper.writeValueAsBytes(payload);
-            return response.bufferFactory().wrap(bytes);
+            return mapper.writeValueAsString(payload);
         } catch (Exception e) {
-            return response.bufferFactory().wrap("{}".getBytes(StandardCharsets.UTF_8));
-        }
-    }
-
-    /** OpenAI 形状的错误体：客户端按 error.type 分流比按字符串匹配可靠。 */
-    private Map<String, Object> errorPayload(Throwable e) {
-        Map<String, Object> error = new LinkedHashMap<>();
-        error.put("message", String.valueOf(e.getMessage()));
-        error.put("type", e instanceof QuotaExceededException ? "rate_limit_exceeded" : "upstream_error");
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("error", error);
-        return body;
-    }
-
-    private String encodeError(Throwable e) {
-        try {
-            return mapper.writeValueAsString(errorPayload(e));
-        } catch (Exception ignored) {
-            return "{\"error\":{\"message\":\"internal error\",\"type\":\"upstream_error\"}}";
+            return "{}";
         }
     }
 

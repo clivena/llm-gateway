@@ -8,10 +8,14 @@ spring:
       port: 6379
   # 成本账本落库（Postgres / R2DBC）。连接是惰性的：Postgres 没起时应用照样能启动，
   # 只在真正写账本时失败并记日志，不影响主链路。
-  # ★ 宿主端口是 55432 不是 5432：本机有 PostgreSQL 10 的 Windows 服务占着 5432，
-  #   用 5432 会连到那个原生实例（没有 llmgw 库）而报 Connection reset。
+  # ★ 宿主端口是 15432 不是 5432，也不是 55432：
+  #   - 5432 被本机 PostgreSQL 10 的 Windows 服务占着，连过去会打到那个原生实例
+  #     （没有 llmgw 库）而报 Connection reset；
+  #   - 55432 落在 Windows 动态端口排除区间 55359-55458 内，docker 绑不上
+  #     （bind: ... forbidden by its access permissions），实测起不来。
+  #   改这里必须同步改 docker-compose.yml 的 ports 映射。
   r2dbc:
-    url: ${POSTGRES_R2DBC_URL:r2dbc:postgresql://localhost:55432/llmgw}
+    url: ${POSTGRES_R2DBC_URL:r2dbc:postgresql://localhost:15432/llmgw}
     username: ${POSTGRES_USER:postgres}
     password: ${POSTGRES_PASSWORD:postgres}
     pool:

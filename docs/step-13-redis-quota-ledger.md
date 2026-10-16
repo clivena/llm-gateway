@@ -18,7 +18,7 @@
 
 | 文件 | 改动 |
 |---|---|
-| `docker-compose.yml` | Postgres 宿主端口 `5432 → 55432`（原因见"坑 2"） |
+| `docker-compose.yml` | Postgres 宿主端口 `5432 → 55432`（原因见"坑 2"）<br>⚠️ **后续修订（2026-10）**：`55432` 落在 Windows 动态端口排除区间 `55359-55458` 内，docker 绑不上，最终改为 `15432`。见 README「踩过的坑」第 2 条 |
 | `pom.xml` | 加 `spring-boot-starter-data-r2dbc` + `r2dbc-postgresql` |
 | `application.yml` | 加 `spring.r2dbc.*`；加 `gateway.cost.sink`（`postgres`/`kafka`/`both`）；加 `gateway.pricing.*` 单价表 |
 | `config/application-local.yml` | `cost.sink: postgres`、配额上限注释 |
@@ -158,6 +158,11 @@ llmgw_ledger_failure_total : 0.0
 
 所以应用连的是那个**原生 Postgres**（没有 `llmgw` 库、凭据也不同），不是容器里的。
 → 把容器映射改成 `55432:5432`，容器内仍是标准 5432，只是宿主侧避让。
+> ⚠️ **后续修订（2026-10）**：`55432` 在 Windows 上属于系统保留的**动态端口排除区间**
+> （`netsh interface ipv4 show excludedportrange protocol=tcp` 可见 `55359-55458`），
+> docker 绑定会报 `bind: ... forbidden by its access permissions`。
+> **实际端口已改为宿主 `15432`** —— 避让 5432 的结论不变，只是具体端口换了。
+> 教训：端口"空闲"不等于"可绑定"。
 > 这是"看起来像网络问题、实际是端口归属问题"的典型。**先用 netstat 确认端口归谁**，
 > 比反复翻代码快得多。
 

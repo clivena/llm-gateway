@@ -7,11 +7,21 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: llmgw
-    # 宿主端口用 55432 而不是 5432：
-    # 本机装了 PostgreSQL 10 的 Windows 服务 (postgresql-x64-10) 并常驻 5432，
-    # 两个 postgres 抢同一端口会导致应用连到「原生那个」（没有 llmgw 库），
-    # 表现为 R2DBC 报 "Failed to obtain R2DBC Connection" + Connection reset。
+    # 宿主端口用 15432 而不是 5432。两个原因，第二个是实测踩出来的：
+    #
+    # ① 本机装了 PostgreSQL 10 的 Windows 服务 (postgresql-x64-10) 并常驻 5432，
+    #    两个 postgres 抢同一端口会导致应用连到「原生那个」（没有 llmgw 库），
+    #    表现为 R2DBC 报 "Failed to obtain R2DBC Connection" + Connection reset。
+    #
+    # ② 曾经用 55432，在**这台机器上起不来**。docker 报：
+    #      bind: An attempt was made to access a socket in a way forbidden
+    #      by its access permissions
+    #    原因是 55432 落在 Windows 动态端口排除区间 55359-55458 内，
+    #    可自查：netsh interface ipv4 show excludedportrange protocol=tcp
+    #    端口看起来「没被占用」，但 docker 就是绑不上——只能绕开。
+    #
     # 容器内仍是标准的 5432，只有宿主映射做了避让。
-    ports: ["55432:5432"]
+    # 改这里必须同步改 application.yml 的 spring.r2dbc.url 默认值。
+    ports: ["15432:5432"]
     volumes:
       - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro

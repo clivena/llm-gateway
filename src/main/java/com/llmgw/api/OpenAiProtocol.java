@@ -27,6 +27,9 @@ import java.util.Map;
  *      （{@link #CACHE_HIT_HEADER}），塞进 body 就破坏了"任何 OpenAI 客户端可直连"这个前提。
  *   B. usage 字段名必须是 snake_case（prompt_tokens / completion_tokens / total_tokens）。
  *      Java DTO 的 camelCase 一旦漏出去，客户端读到的就是 0。
+ *   C. finish_reason 必须**原样透传**上游给的值。这里曾经硬编码 "stop"，
+ *      于是上游因预算耗尽而 {@code finish_reason=length} + 空正文的响应，
+ *      会被网关报成"正常结束"—— 客户端连"这次被截断了"都无从判断（F0 修）。
  */
 public final class OpenAiProtocol {
 
@@ -50,9 +53,16 @@ public final class OpenAiProtocol {
      *
      * 注意入参里**没有 cacheHit** —— 这是刻意的：命中信息由调用方写进响应头，
      * 让它进不了这个 body 构造器，就没法被顺手塞进去。
+     *
+     * @param finishReason 上游原样返回的 finish_reason。**不能硬编码成 "stop"**：
+     *                     F0 之前这里写死是 "stop"，于是被截断的响应
+     *                     （{@code finish_reason=length} + 空正文）会告诉客户端
+     *                     "正常结束了"。这比不返回该字段更坏 —— 客户端连猜的机会都没有。
+     *                     为 null 时回退 "stop"（网关自己合成的响应没有上游值可透传）。
      */
     public static Map<String, Object> chatCompletionBody(String id, String model,
-                                                         String content, Usage usage) {
+                                                         String content, Usage usage,
+                                                         String finishReason) {
         Map<String, Object> body = envelope(id, OBJECT_COMPLETION, model);
         List<Map<String, Object>> choices = new ArrayList<>();
 
@@ -63,7 +73,7 @@ public final class OpenAiProtocol {
         Map<String, Object> choice = new LinkedHashMap<>();
         choice.put("index", 0);
         choice.put("message", message);
-        choice.put("finish_reason", "stop");
+        choice.put("finish_reason", normalizeFinishReason(finishReason));
         choices.add(choice);
 
         body.put("choices", choices);
@@ -72,8 +82,33 @@ public final class OpenAiProtocol {
     }
 
     /**
-     * 流式分片。增量放在 choices[0].delta.content，与 OpenAI 一致。
-     * 分片的 finish_reason 一律为 null —— 终止由 {@link #DONE} 帧表达。
+     * 流式收尾帧：{@code delta} 是**空对象**、{@code finish_reason} 非 null。
+     *
+     * 这是 OpenAI SSE 规范里"流正常结束"的表达方式。不塞 delta.content 是关键 ——
+     * 空 delta 分片在部分客户端上会被当成"又收到一段空回复"，
+     * 所以这里刻意不复用 {@link #chatCompletionChunk}。
+     */
+    public static Map<String, Object> chatCompletionFinishChunk(String id, String model,
+                                                               String finishReason) {
+        Map<String, Object> body = envelope(id, OBJECT_CHUNK, model);
+        List<Map<String, Object>> choices = new ArrayList<>();
+
+        Map<String, Object> choice = new LinkedHashMap<>();
+        choice.put("index", 0);
+        choice.put("delta", new LinkedHashMap<String, Object>());
+        choice.put("finish_reason", normalizeFinishReason(finishReason));
+        choices.add(choice);
+
+        body.put("choices", choices);
+        return body;
+    }
+
+    /**
+     * 流式文本分片。增量放在 choices[0].delta.content，与 OpenAI 一致。
+     *
+     * 分片的 finish_reason 一律为 null —— 文本分片不是结束信号。
+     * 流的结束由两件事表达：{@link #chatCompletionFinishChunk}（带 finish_reason 的
+     * 收尾帧）与 {@link #DONE} 帧。
      */
     public static Map<String, Object> chatCompletionChunk(String id, String model, String delta) {
         Map<String, Object> body = envelope(id, OBJECT_CHUNK, model);
@@ -175,6 +210,17 @@ public final class OpenAiProtocol {
     }
 
     // --- 内部 ---
+
+    /**
+     * finish_reason 兜底为 "stop"。
+     *
+     * 只在**上游没给**时兜底（网关自己合成的响应，如缓存命中、流式快照）。
+     * 上游给了就原样透传 —— 包括 "length" 这种"不圆满"的值。
+     * 把 length 也统一美化成 stop 是 F0 修掉的那个静默失效。
+     */
+    private static String normalizeFinishReason(String finishReason) {
+        return (finishReason == null || finishReason.isBlank()) ? "stop" : finishReason;
+    }
 
     private static Map<String, Object> envelope(String id, String object, String model) {
         Map<String, Object> body = new LinkedHashMap<>();

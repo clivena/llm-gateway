@@ -278,8 +278,10 @@ python scripts/run-gateway-smoke.py
 > 复现：`python scripts/run-gateway-smoke.py`（主链路 + 流式 + 指标）、
 > `python scripts/check-quota-concurrency.py`（配额并发，自带 6 条断言）、
 > `python scripts/calibrate-token-estimator.py`（配额估算精度，六组探针）、
-> `python scripts/check-cache-layers.py`（缓存是否真的命中，8 条断言）。
-> 四条脚本都会自己起服务、摘除端口劫持环境变量、跑完自动关服务。
+> `python scripts/check-cache-layers.py`（缓存是否真的命中，8 条断言）、
+> `python scripts/check-f0-failure-semantics.py`（推理型模型失败语义 + 配额结算，8 条断言）。
+> 五条脚本都会自己起服务、摘除端口劫持环境变量、跑完自动关服务，
+> 并**在开始前检查 Redis/Postgres 容器是否在跑**（缺依赖时失败会长得像代码 bug）。
 
 > 排查上游行为用 `python scripts/probe-upstream-shape.py`
 > ——它扫描 `max_tokens` 与响应字段，用来回答"上游到底返回了什么"
@@ -318,9 +320,28 @@ python scripts/run-gateway-smoke.py
 （响应头 `X-Cache-Hit` + 明显更快 + 未计费）——只看响应头的话，
 一个"永远返回 true 的 bug"也能骗过测试。
 
+### F0 验证（推理型模型失败语义 + 配额结算）
+
+`check-f0-failure-semantics.py` —— **8/8 PASS**。
+
+| 检查 | 结果 |
+|---|---|
+| 非流式 `finish_reason` 透传 | `finish_reason='length'`、正文 0 字（`max_tokens=64`）<br>F0 之前这里恒为 `'stop'` —— 网关主动把"被截断"报成"正常结束" |
+| 流式收尾帧 | 收尾帧 1 个、`finish_reason='length'`、`delta` 为空对象、`[DONE]` 正常 |
+| 配额结算覆盖 completion | **增量 2498 == 账本真实 tokens 2498**（prompt 34 + completion 2464）<br>F0 之前只会记 34 —— 计量只覆盖实际消耗的 **1.4%** |
+| 缓存命中全额退还预扣 | 命中前后配额增量 **0**（此前命中省了钱却照样吃配额） |
+| `llmgw.upstream.empty` / `.truncated` | 0 → 1 / 0 → 1 |
+| `llmgw.quota.settled` / `.settle.failed` | 4 / **0** |
+
+`quota_settle.lua` 的四条语义另用 `redis-cli --eval` 单独验过：
+补扣（34 → +1605 → 1639）、退还（-1639 → 0）、周期翻篇返回 -1、
+下限保护（已用 50 退 -9999 → 0）。
+
 > 复查这批缺陷的共同特征是**"静默失效"**：
 > 缓存 key 少一个模型维度不会报错，只会让路由策略被悄悄架空；
-> 落账同步执行也不会报错，只会在 Kafka 不可用时把最快的路径变成最慢的。
+> 落账同步执行也不会报错，只会在 Kafka 不可用时把最快的路径变成最慢的；
+> `finish_reason` 填一个假的 `"stop"` 更不会报错 —— 它只会让客户端
+> 在答案被截断时以为一切都好。
 > 这类问题在监控上看起来一切正常。
 
 ---
@@ -361,7 +382,7 @@ python scripts/run-gateway-smoke.py
 8. **运行期日志是中文**：Windows 控制台默认 GBK(936)，Java 也按 GBK 输出，
    在 cmd 里正常；但管道/重定向被按 UTF-8 解码时会显示为乱码。
    面向开源协作者，后续应把启动与配置类日志改成英文（代码注释可以保留中文）。
-9. **上游是推理型模型，而网关还没为它调整失败语义**（本项待修，已排入下一批）：
+9. ~~**上游是推理型模型，而网关还没为它调整失败语义**~~ → **已修（F0）**：
    当前验证用的 DeepSeek 两个模型响应里都带 `reasoning_content`，
    且 `max_tokens` 是**"推理 + 正文"的总预算**。实测（`scripts/probe-upstream-shape.py`）：
 
@@ -370,16 +391,31 @@ python scripts/run-gateway-smoke.py
    | `deepseek-flash` | 空（仅推理） | 空（仅推理） | 217 字 | 1220 字 |
    | `deepseek-v4-pro` | 空（仅推理） | 1514 字 | 2483 字 | 2639 字 |
 
-   由此暴露两个缺口：
+   这三条都已修掉：
 
-   - **`finish_reason` 没有透传**：`OpenAiAdapter` 只取 `message.content`，
-     于是 `finish_reason: length` + 空正文（推理模型最常见的失败形态）
-     与"模型真的什么都没说"在客户端看来完全一样。
-   - **配额只扣 prompt，completion 从不入账**：`QuotaService.tryConsume` 是唯一
-     写入配额键的地方，没有结算/补扣步骤。而实测 completion 是 prompt 的
-     **20~100 倍**（prompt 33~87 → completion 755~3516）。所以
-     `quota.default-limit-tokens` 目前实际约束的是 **prompt 侧**，
-     不是总 token —— 这条必须与账单口径对齐后再对外宣称。
+   - **`finish_reason` 现在原样透传**。此前 `OpenAiProtocol` 把它**硬编码成 `"stop"`**，
+     于是 `finish_reason=length` + 空正文（推理模型最常见的失败形态）
+     会被网关主动报成"正常结束"—— 客户端连"这次被截断了"都无从判断。
+     流式侧同样补上了**收尾帧**（`delta: {}` + 非 null 的 `finish_reason`）。
+   - **空正文与截断现在分开计数**（`llmgw.upstream.empty` / `.truncated`）。
+     两者单独出现时含义相反：前者是上游故障信号该告警，后者是客户端
+     `max_tokens` 设小了该找调用方。失败谓词（供后续重试/故障转移使用）
+     由 `UpstreamOutcome` 给出，口径只有一处定义。
+   - **配额改成 reserve-then-settle**（预扣 + 按真实 usage 结算补扣）。
+     此前只有预扣没有结算，配额记的永远是"prompt 估算之和"，
+     而实测 completion 是 prompt 的 **20~100 倍**（prompt 33~87 → completion 755~3516）——
+     真机验证：一次请求的配额增量 **2498 == 账本真实 tokens 2498**（F0 之前只会记 34）。
+     缓存命中路径**全额退还预扣**（此前命中省了钱却照样吃配额）。
+
+   > 已知代价：reserve-then-settle 天然允许**小幅超发** —— 真实值要等上游返回才知道，
+   > 那时钱已经花了。这是选这个口径时知情接受的，不是缺陷；
+   > 要收紧应改用"按 `max_tokens` 上界预留"，而不是在结算时补一道闸。
+
+10. **上游帧形状的兼容性只覆盖了实测到的那几种**：新增的上游收尾帧处理是在
+    DeepSeek 的帧形状上验证的。不同供应商对"末帧"的表达不一致
+    （有的把 `finish_reason` 与 `usage` 放同一帧，有的分两帧，有的不发 `usage`）。
+    解析层已经用了 `flatMapIterable` 允许一帧映射出多个分片，
+    但**换供应商仍应重新跑一遍 `scripts/check-f0-failure-semantics.py`**。
 
 ---
 
@@ -417,6 +453,7 @@ python scripts/run-gateway-smoke.py
 | [15](./docs/step-15-review-fixes.md) | 全量复查：修掉 5 个"静默失效"缺陷 |
 | [16](./docs/step-16-reactive-multi-provider.md) | 响应式化 + 多 provider + 路由配置化（让"非阻塞"可 grep 验证） |
 | [17](./docs/step-17-token-estimate-and-cache-layers.md) | **估算从"猜"变"算"**：`TokenEstimator` + 缓存拆两级 + MDC 贯通 |
+| [18](./docs/step-18-reasoning-model-failure-semantics.md) | **推理型模型的失败语义**：`finish_reason` 透传 + 配额 reserve-then-settle |
 
 ---
 

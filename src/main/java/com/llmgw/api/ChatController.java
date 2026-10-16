@@ -81,7 +81,8 @@ public class ChatController {
                     response.getHeaders().set(OpenAiProtocol.CACHE_HIT_HEADER,
                             String.valueOf(resp.cacheHit()));
                     Object body = OpenAiProtocol.chatCompletionBody(
-                            resp.id(), resp.model(), resp.content(), resp.usage());
+                            resp.id(), resp.model(), resp.content(), resp.usage(),
+                            resp.finishReason());
                     return response.writeWith(Mono.fromSupplier(() -> toBuffer(response, body)));
                 })
                 .onErrorResume(e -> {
@@ -122,6 +123,14 @@ public class ChatController {
                         // 客户端与账本同时看到错的归属（F5）。
                         sink.next(toSseFrame(asJson(
                                 OpenAiProtocol.chatCompletionChunk(chunkId, chunk.model(), chunk.delta()))));
+                        return;
+                    }
+                    // 收尾帧（F0）：把上游的 finish_reason 交给客户端。
+                    // 不转发的话，流式路径上"正常结束"与"被 length 截断"长得一模一样 ——
+                    // 用户只会看到一个突然停住的答案，然后收到 [DONE]。
+                    if (chunk.isFinish()) {
+                        sink.next(toSseFrame(asJson(OpenAiProtocol.chatCompletionFinishChunk(
+                                chunkId, chunk.model(), chunk.finishReason()))));
                         return;
                     }
                     if (chunk.usage() != null && clientWantsUsage) {

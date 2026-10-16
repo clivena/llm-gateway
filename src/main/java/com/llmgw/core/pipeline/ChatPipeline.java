@@ -9,6 +9,7 @@ import com.llmgw.core.cost.CostLedgerService;
 import com.llmgw.core.protocol.ProviderAdapter;
 import com.llmgw.core.protocol.ProviderRegistry;
 import com.llmgw.core.protocol.StreamChunk;
+import com.llmgw.core.protocol.UpstreamOutcome;
 import com.llmgw.core.quota.QuotaExceededException;
 import com.llmgw.core.quota.QuotaService;
 import com.llmgw.core.router.ModelTier;
@@ -24,6 +25,7 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -119,11 +121,16 @@ public class ChatPipeline {
                                 // 旧实现这里是同步 ledger.record —— 命中本来是最快的路径，
                                 // 却在 Kafka 不可达时白等 max.block.ms，把优化点变成新瓶颈。
                                 recordAsync(traceId, apiKey, request, payload, 0.0, latency);
-                                return Mono.just(payload);
+                                // 结算（F0）：缓存命中 = 完全没走上游 = 真实用量为 0。
+                                // 预扣的那笔必须**全额退还** —— 否则命中一次反而白扣一次配额，
+                                // 而"命中就省钱"正是缓存存在的全部理由。
+                                // 这一条在 F0 之前是漏的：命中省了钱，却照样吃配额。
+                                return settleQuota(apiKey, estimatedTokens, 0).thenReturn(payload);
                             })
                             .switchIfEmpty(Mono.defer(() -> {
                                 metrics.onCacheMiss();
-                                return dispatch(apiKey, request, question, tier, start, traceId);
+                                return dispatch(apiKey, request, question, tier, start, traceId,
+                                        estimatedTokens);
                             }));
                 });
     }
@@ -150,35 +157,54 @@ public class ChatPipeline {
                                         new ChatResponse("cache", "cache", hit.answer(),
                                                 new Usage(0, 0), true),
                                         0.0, 0);
+                                // 命中即全额退还预扣，与非流式路径同一条理由（见 execute）。
+                                // 注意这里是 flatMapMany：退还完成后再把分片发出去，
+                                // 保证"流结束 ⇒ 配额已结清"这个不变量成立。
                                 // 模型名标记为 cache：客户端能从分片里看出这次没走上游。
-                                return Flux.just(StreamChunk.delta("cache", hit.answer()));
+                                return settleQuota(apiKey, estimatedTokens, 0)
+                                        .thenMany(Flux.just(StreamChunk.delta("cache", hit.answer())));
                             })
                             .switchIfEmpty(Flux.defer(() -> {
                                 // 非流式分支里有 onCacheMiss，流式分支曾经漏了 ——
                                 // 结果是指标统计偏低（实测 3 次请求只记到 2 次 miss）
                                 metrics.onCacheMiss();
-                                return streamDispatch(apiKey, request, question, tier, traceId);
+                                return streamDispatch(apiKey, request, question, tier, traceId,
+                                        estimatedTokens);
                             }));
                 });
     }
 
     private Mono<ChatResponse> dispatch(String apiKey, ChatRequest request, String question,
-                                         ModelTier tier, long start, String traceId) {
+                                         ModelTier tier, long start, String traceId, long reserved) {
         ProviderAdapter adapter = providers.forModel(tier.model());
         long begin = System.currentTimeMillis();
+        // 本次请求实际消耗的总 token，可能来自**两次**上游调用（级联升级）。
+        // 用 AtomicLong 在这里汇合两条路径的用量，正好是配额结算需要的口径：
+        // 不变量 C 说"两次调用就有两份费用"，那就该有两份 token 计入配额 ——
+        // 账本与配额两个口径必须一致，否则对不上账时不知道信哪个。
+        AtomicLong spentTokens = new AtomicLong(0);
 
         return adapter.chat(tier.model(), request)
                 .flatMap(response -> {
-                    boolean formatValid = response.content() != null && !response.content().isBlank();
-                    if (routerService.shouldEscalate(tier, response.content(), formatValid)) {
+                    // F0：先判定"上游到底给了什么"，再谈怎么处理。
+                    UpstreamOutcome outcome = UpstreamOutcome.of(response.content(), response.finishReason());
+                    metrics.onUpstreamOutcome(outcome);
+                    logOutcome("non-stream", tier.model(), outcome, response.usage());
+
+                    if (routerService.shouldEscalate(tier, response.content(), !outcome.empty())) {
                         metrics.onEscalate();
                         // 不变量 C：被升级掉的这一次调用已经真实发生并计费，
                         // 必须单独落一条账。旧实现只记最终强模型那一次，
                         // 于是"实际两次上游调用、账本记一份金额"，成本归因系统性偏低。
-                        Usage firstUsage = adapter.estimateUsage(tier.model(), request, response.content());
+                        //
+                        // 用**真实** usage 而不是 estimateUsage：真实值就在 response.usage() 里，
+                        // 手上有真值却去估算，会让账本与配额两个口径同时失真（F0 修）。
+                        // usageOrEstimate 只在真实值缺失时才回退。
+                        Usage firstUsage = usageOrEstimate(request, response);
+                        spentTokens.addAndGet(firstUsage.total());
                         recordAsync(traceId, apiKey, request,
                                 new ChatResponse(response.id(), tier.model(), response.content(),
-                                        firstUsage, false),
+                                        firstUsage, false, response.finishReason()),
                                 estimateCost(tier.model(), tier, firstUsage),
                                 System.currentTimeMillis() - start);
 
@@ -186,29 +212,46 @@ public class ChatPipeline {
                         ProviderAdapter strongAdapter = providers.forModel(stronger.model());
                         return strongAdapter.chat(stronger.model(), request)
                                 .map(upgraded -> new ChatResponse(upgraded.id(), stronger.model(),
-                                        upgraded.content(), upgraded.usage(), false));
+                                        upgraded.content(), upgraded.usage(), false,
+                                        upgraded.finishReason()));
                     }
                     return Mono.just(response);
                 })
-                .doOnNext(response -> {
+                .flatMap(response -> {
                     long latency = System.currentTimeMillis() - (start == 0 ? begin : start);
-                    Usage usage = response.usage() == null ? new Usage(0, 0) : response.usage();
+                    // 上游没给可信 usage 时回退估算（F0）。这一步不能省：
+                    // 结算按 actual 补扣，若把"没给 usage"当成 0，会**退掉整笔预扣** ——
+                    // 而这次请求明明花了钱。账本那边同理，会记一条 0 成本的假账。
+                    Usage usage = usageOrEstimate(request, response);
+                    spentTokens.addAndGet(usage.total());
                     // 延迟指标必须独立于账本：账本走的是 Kafka/Postgres 异步链路，
                     // 那条链路挂了正是最需要看延迟的时刻 —— 记在账本里会一起瞎掉。
                     metrics.recordLatency(response.model(), false, latency);
-                    recordAsync(traceId, apiKey, request, response,
+                    // 落账用同一份 usage（缺失时是回退值），保证账本与配额两个口径一致 ——
+                    // 两边不一致时对账根本不知道信哪个。传入的 ChatResponse 只在
+                    // "真实 usage 缺失"时才需要重建，正常路径直接复用原对象。
+                    ChatResponse ledgerRow = (response.usage() != null && response.usage().total() > 0)
+                            ? response
+                            : new ChatResponse(response.id(), response.model(), response.content(),
+                                    usage, response.cacheHit(), response.finishReason());
+                    recordAsync(traceId, apiKey, request, ledgerRow,
                             estimateCost(response.model(), tier, usage), latency);
                     if (!response.cacheHit()) {
                         // 不变量 B：缓存段按"实际服务的模型"划，不用请求档位划，
                         // 否则升级后的高质量答案会被写进便宜模型的段里、被后续低价请求复用。
+                        // 空答案由 writeCache 自己拒绝写入（它会打 warn），这里不重复判。
                         writeCache(cacheNamespace(apiKey, response.model()),
                                 question, response.content());
                     }
+                    // 结算放在返回之前（不是 fire-and-forget）：一次 Redis 往返，
+                    // 换来一个容易验证的不变量 —— "响应已返回 ⇒ 配额已结清"。
+                    // 若改为异步，配额面板就可能比账本慢一拍，对账时说不清谁是对的。
+                    return settleQuota(apiKey, reserved, spentTokens.get()).thenReturn(response);
                 });
     }
 
     private Flux<StreamChunk> streamDispatch(String apiKey, ChatRequest request, String question,
-                                              ModelTier tier, String traceId) {
+                                              ModelTier tier, String traceId, long reserved) {
         ProviderAdapter cheap = providers.forModel(tier.model());
         AtomicBoolean emitted = new AtomicBoolean(false);
         // 级联升级后实际服务的是更强的模型，账本与响应分片都必须记真实模型名，
@@ -216,13 +259,18 @@ public class ChatPipeline {
         AtomicReference<String> servedBy = new AtomicReference<>(tier.model());
         // 上游末帧的真实用量。拿不到时才回退估算（F4）。
         AtomicReference<Usage> upstreamUsage = new AtomicReference<>();
+        // 上游的收尾帧给的原因（F0）。流式同样需要它 —— 否则客户端看到 [DONE]
+        // 也分不清"正常结束"和"被 length 截断"。
+        AtomicReference<String> finishReason = new AtomicReference<>();
         StringBuilder collected = new StringBuilder();
         long start = System.currentTimeMillis();
+        // 待结算的真实用量。-1 表示"还没走到流结束"，此时不该结算。
+        AtomicLong settleAmount = new AtomicLong(-1);
 
         Flux<StreamChunk> primary = cheap.chatStream(tier.model(), request)
-                .doOnNext(chunk -> collect(chunk, emitted, collected, upstreamUsage));
+                .doOnNext(chunk -> collect(chunk, emitted, collected, upstreamUsage, finishReason));
 
-        return primary
+        Flux<StreamChunk> body = primary
                 // 已输出内容后不再切换模型，避免用户看到两段拼接的答案
                 .onErrorResume(e -> emitted.get()
                         ? Flux.<StreamChunk>error(e)
@@ -230,9 +278,12 @@ public class ChatPipeline {
                             metrics.onEscalate();
                             ModelTier stronger = routerService.escalateFrom(tier);
                             servedBy.set(stronger.model());
+                            // 换了模型，上一次调用留下的 finish_reason 必须清掉：
+                            // 那是"便宜模型为什么被换掉"的原因，不是最终答案的原因。
+                            finishReason.set(null);
                             return providers.forModel(stronger.model())
                                     .chatStream(stronger.model(), request)
-                                    .doOnNext(chunk -> collect(chunk, emitted, collected, upstreamUsage));
+                                    .doOnNext(chunk -> collect(chunk, emitted, collected, upstreamUsage, finishReason));
                         }))
                 .doOnComplete(() -> {
                     long latency = System.currentTimeMillis() - start;
@@ -247,22 +298,46 @@ public class ChatPipeline {
                     Usage usage = upstreamUsage.get() != null
                             ? upstreamUsage.get()
                             : tokenEstimator.estimateUsage(request.messages(), collected.toString());
-                    ChatResponse snapshot = new ChatResponse("stream", model, collected.toString(), usage, false);
+                    // F0：流式也要判定可用性。用"累积到的整条正文"而不是单帧 ——
+                    // 流式途中每一帧都很短，只有汇总才说明问题。
+                    UpstreamOutcome outcome = UpstreamOutcome.of(collected.toString(), finishReason.get());
+                    metrics.onUpstreamOutcome(outcome);
+                    logOutcome("stream", model, outcome, usage);
+
+                    ChatResponse snapshot = new ChatResponse("stream", model, collected.toString(),
+                            usage, false, finishReason.get());
                     recordAsync(traceId, apiKey, request, snapshot,
                             estimateCost(model, tier, usage), latency);
                     writeCache(cacheNamespace(apiKey, model), question, collected.toString());
+                    settleAmount.set(usage.total());
                 });
+
+        // 结算串在流的**末尾**而不是丢进 doOnComplete 里 fire-and-forget。
+        // 理由是那个可验证的不变量："客户端收到 [DONE] ⇒ 配额已结清"。
+        // 若用 doFinally 会把"客户端中途断开"也当成完成去结算 —— 而那种情况下
+        // 上游已经花了钱，预扣本就该留着。
+        return body.concatWith(Flux.defer(() -> {
+            long amount = settleAmount.get();
+            if (amount < 0) {
+                return Flux.empty();
+            }
+            return settleQuota(apiKey, reserved, amount).thenMany(Flux.<StreamChunk>empty());
+        }));
     }
 
-    /** 累积一条上游分片：文本进缓冲，用量进引用。用量帧不影响 emitted（它没有内容）。 */
-    private static void collect(StreamChunk chunk, AtomicBoolean emitted,
-                                StringBuilder collected, AtomicReference<Usage> upstreamUsage) {
+    /** 累积一条上游分片：文本进缓冲，用量与收尾原因进引用。用量/收尾帧不影响 emitted（它们没有内容）。 */
+    private static void collect(StreamChunk chunk, AtomicBoolean emitted, StringBuilder collected,
+                                AtomicReference<Usage> upstreamUsage,
+                                AtomicReference<String> finishReason) {
         if (chunk.hasDelta()) {
             emitted.set(true);
             collected.append(chunk.delta());
         }
         if (chunk.usage() != null) {
             upstreamUsage.set(chunk.usage());
+        }
+        if (chunk.isFinish()) {
+            finishReason.set(chunk.finishReason());
         }
     }
 
@@ -292,6 +367,66 @@ public class ChatPipeline {
             return price.costOf(usage.promptTokens(), usage.completionTokens());
         }
         return usage.total() / 1000.0 * tier.costPer1k();
+    }
+
+    /**
+     * 优先取上游回传的**真实** usage，缺失才回退估算（F0）。
+     *
+     * <p>为什么必须回退而不是填 0：配额结算是按 {@code actual - reserved} 补扣的，
+     * 如果"上游没给 usage"就当成 actual=0，等于**把整笔预扣退回去** ——
+     * 而这次请求明明花了钱。同理账本会记一条 0 成本的假账。
+     * "不知道花了多少"不等于"没花钱"，宁可退回估算值。
+     *
+     * <p>用 {@code tokenEstimator} 而不是 {@code adapter.estimateUsage}：
+     * 级联升级后最终响应的模型可能是**另一家** provider 的，用旧的 adapter
+     * 去估算语义上就不成立（虽然当前实现恰好是同一个纯公式，那是巧合不是契约）。
+     * 管线手上有 estimator，直接用。
+     *
+     * <p>判定用 {@code total() > 0} 而不是 {@code usage != null}：上游确实可能回一个
+     * {@code {prompt_tokens:0, completion_tokens:0}} 的壳，那种"有对象但没数"的情况
+     * 也应当走估算。
+     */
+    private Usage usageOrEstimate(ChatRequest request, ChatResponse response) {
+        Usage real = response.usage();
+        if (real != null && real.total() > 0) {
+            return real;
+        }
+        return tokenEstimator.estimateUsage(request.messages(), response.content());
+    }
+
+    /**
+     * 上游"给了响应但没给答案"时的告警（F0）。
+     *
+     * 为什么必须留这条日志：这类失败在 F0 之前**完全不可见** —— 上游 HTTP 200、
+     * 网关主链路一切正常、账本正常落账、日志一片干净，只有客户端发现答案是空的，
+     * 而它还以为这就叫成功。指标能告诉你"变多了"，日志才能告诉你"长什么样"：
+     * finish_reason 是什么、这次花了多少 token。
+     */
+    private void logOutcome(String path, String model, UpstreamOutcome outcome, Usage usage) {
+        if (outcome.empty() || outcome.truncated()) {
+            log.warn("upstream returned unusable response [{} model={} finish_reason={}]: {} usage={}",
+                    path, model, outcome.finishReason(), outcome.describe(), usage);
+        }
+    }
+
+    /**
+     * 按真实用量结算配额差额（F0）。失败不抛 —— 结算失败不该把一次**已经成功**
+     * 的请求变成失败，代价只是这一次的配额失真（已计数 + 打日志）。
+     */
+    private Mono<Void> settleQuota(String apiKey, long reserved, long actual) {
+        return quotaService.settle(apiKey, reserved, actual)
+                .doOnNext(finalUsed -> {
+                    if (finalUsed >= 0) {
+                        metrics.onQuotaSettled();
+                    }
+                })
+                .onErrorResume(e -> {
+                    metrics.onQuotaSettleFailed();
+                    log.warn("quota settle failed [apiKey={} reserved={} actual={}]: {}",
+                            apiKey, reserved, actual, e.toString());
+                    return Mono.empty();
+                })
+                .then();
     }
 
     /**

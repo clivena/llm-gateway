@@ -147,11 +147,14 @@ public class OpenAiAdapter implements ProviderAdapter {
                     + error.path("message").asText(error.toString()));
         }
         String content = node.path("choices").path(0).path("message").path("content").asText("");
+        // finish_reason 必须带出来（F0）。上游对"预算耗尽"的正式表达就是
+        // finish_reason=length + content=""，丢掉它等于把"被截断"伪装成"正常结束"。
+        String finishReason = node.path("choices").path(0).path("finish_reason").asText(null);
         JsonNode usage = node.path("usage");
         Usage u = new Usage(usage.path("prompt_tokens").asInt(0),
                 usage.path("completion_tokens").asInt(0));
         String id = node.path("id").asText("chatcmpl");
-        return new ChatResponse(id, model, content, u, false);
+        return new ChatResponse(id, model, content, u, false, finishReason);
     }
 
     @Override
@@ -171,25 +174,59 @@ public class OpenAiAdapter implements ProviderAdapter {
                 })
                 .takeUntil("[DONE]"::equals)
                 .filter(d -> !"[DONE]".equals(d))
-                .handle((String json, SynchronousSink<StreamChunk> sink) -> {
-                    JsonNode node = readTreeOrNull(json);
-                    if (node == null) {
-                        return;
-                    }
-                    // 用量帧：choices 为空、usage 有值。必须单独带出来 ——
-                    // 旧实现把它当"没有 content 的分片"丢掉，流式账本因此只能估算。
-                    JsonNode usage = node.path("usage");
-                    if (usage.has("prompt_tokens") || usage.has("total_tokens")) {
-                        sink.next(StreamChunk.usage(model, new Usage(
-                                usage.path("prompt_tokens").asInt(0),
-                                usage.path("completion_tokens").asInt(0))));
-                    }
-                    // 文本增量帧。同理：role-only / reasoning-only 分片直接跳过。
-                    JsonNode delta = node.path("choices").path(0).path("delta").path("content");
-                    if (!delta.isMissingNode() && !delta.isNull() && !delta.asText().isEmpty()) {
-                        sink.next(StreamChunk.delta(model, delta.asText()));
-                    }
-                });
+                // 用 flatMapIterable 而不是 handle：
+                // **一帧上游分片可能同时携带多种信息**，必须允许一次映射出多个
+                // StreamChunk。用 handle 的话，SynchronousSink 每次只允许发一个 ——
+                // 第二个 sink.next() 会直接抛 "Cannot emit more than one data"。
+                //
+                // 这个坑真实踩到了：DeepSeek 的**末帧同时带 usage 与 finish_reason**
+                // （include_usage=true 时），于是"用量分支 + 收尾分支"各发一次就把
+                // 整条流打成 502。而在此之前它一直是好的 —— 因为 Delta 帧没有 usage、
+                // 用量帧没有 choices，两个分支从未在同一次调用里同时命中。
+                // 也就是说旧写法是**靠数据形状的巧合在运行**。
+                .flatMapIterable(json -> parseChunk(json, model));
+    }
+
+    /**
+     * 把一帧上游 SSE 的 JSON 解析成 0~2 个 {@link StreamChunk}。
+     *
+     * <p>抽成独立静态方法是为了**可测**：这个方法的唯一难点是"一帧可能同时是
+     * 用量帧与收尾帧"，而它曾经因为"一次只能发一个"把整条流打成 502。
+     * 埋在 {@code flatMapIterable} 的 lambda 里就没法为它写单测 ——
+     * 而这个坑值得一条永久的回归断言。见 {@code OpenAiAdapterChunkTest}。
+     *
+     * @return 可能为空（该帧没有任何要转发的信息，例如 role-only / reasoning-only 帧）
+     */
+    static List<StreamChunk> parseChunk(String json, String model) {
+        JsonNode node = readTreeOrNull(json);
+        if (node == null) {
+            return List.of();
+        }
+        List<StreamChunk> out = new ArrayList<>(2);
+
+        // 用量帧：choices 为空、usage 有值。必须单独带出来 ——
+        // 旧实现把它当"没有 content 的分片"丢掉，流式账本因此只能估算。
+        JsonNode usage = node.path("usage");
+        if (usage.has("prompt_tokens") || usage.has("total_tokens")) {
+            out.add(StreamChunk.usage(model, new Usage(
+                    usage.path("prompt_tokens").asInt(0),
+                    usage.path("completion_tokens").asInt(0))));
+        }
+        // 文本增量帧。role-only / reasoning-only 分片在这里被跳过。
+        JsonNode delta = node.path("choices").path(0).path("delta").path("content");
+        if (!delta.isMissingNode() && !delta.isNull() && !delta.asText().isEmpty()) {
+            out.add(StreamChunk.delta(model, delta.asText()));
+        }
+        // 收尾帧（F0）：上游在流末尾发的那个"带 finish_reason"的分片。
+        // 必须单独带出来 —— 旧实现把它连同 reasoning-only 分片一起
+        // 当成"没有 content 的分片"丢掉了，于是流式路径上客户端同样无法分辨
+        // "正常结束"和"被 length 截断"（非流式那边的对应问题是
+        // OpenAiProtocol 把 finish_reason 硬编码成 stop）。
+        JsonNode finish = node.path("choices").path(0).path("finish_reason");
+        if (!finish.isMissingNode() && !finish.isNull() && !finish.asText().isEmpty()) {
+            out.add(StreamChunk.finish(model, finish.asText()));
+        }
+        return out;
     }
 
     private static JsonNode readTreeOrNull(String json) {

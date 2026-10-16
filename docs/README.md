@@ -18,6 +18,7 @@
 | 15 | 全量复查：修掉 5 个"静默失效"缺陷 | [step-15](./step-15-review-fixes.md) |
 | 16 | 响应式化 + 多 provider + 路由配置化 | [step-16](./step-16-reactive-multi-provider.md) |
 | 17 | **估算从"猜"变"算"** + 缓存拆两级 + MDC 贯通 | [step-17](./step-17-token-estimate-and-cache-layers.md) |
+| 18 | 推理型模型的失败语义 + 配额 reserve-then-settle（F0） | [step-18](./step-18-reasoning-model-failure-semantics.md) |
 
 > 16 与 17 均已成篇。14 号步骤当时未单独成篇，内容并入 [step-15](./step-15-review-fixes.md)。
 > 当前状态与已知边界见 [README 的已知边界](../README.md#已知边界诚实清单)。
@@ -35,6 +36,9 @@
 | [step-11](./step-11-provider-config.md) | `List<ProviderAdapter>` 里永远只有 1 个元素 | **不成立**：见 `ProviderRegistry`，每家 provider 一个适配器 |
 | [step-12](./step-12-live-integration.md) | "多供应商 ❌ 未实现" | **已实现** |
 | [step-11](./step-11-provider-config.md) / [step-12](./step-12-live-integration.md) | `adapterFor(model)` 做模型校验 | 方法已不存在，职责移到 `ProviderRegistry.forModel`（找不到抛 `IllegalArgumentException` → HTTP 400） |
+| [step-04](./step-04-semantic-cache.md) | 缓存就是"语义缓存"，依赖向量检索 | **已变更**：拆成两级 —— L1 精确（哈希，**不依赖 embedding**）+ L2 语义（向量，可选）。原因是原实现下"缓存开着但真机一次都没命中"是常态（见 [step-17](./step-17-token-estimate-and-cache-layers.md)） |
+| [step-03](./step-03-chat-pipeline.md) / [step-05](./step-05-quota-lua.md) | 配额是"一次原子预扣"，扣的就是本次消耗 | **已变更**：改成 reserve-then-settle 两段式。预扣只按 prompt 估算，响应后按真实 usage 补扣；缓存命中全额退还（见 [step-18](./step-18-reasoning-model-failure-semantics.md)） |
+| [step-02](./step-02-upstream-adapter.md) | 非流式只取 `message.content` | **已增强**：同时透传 `finish_reason`；流式补上收尾帧。硬编码 `"stop"` 会把"被截断"报成"正常结束"（见 [step-18](./step-18-reasoning-model-failure-semantics.md)） |
 | [step-03](./step-03-chat-pipeline.md) | 管线里用 `Flux.defer(...)` 包住同步调用 + `subscribeOn` 挪出事件循环 | **不成立**：适配器接口本身已返回 `Mono`/`Flux`，全链路 `.block()` 残留为 0 |
 
 ---

@@ -38,7 +38,7 @@ class OpenAiProtocolTest {
     @Test
     void completionBodyCarriesChoicesWithAssistantMessage() throws Exception {
         JsonNode node = json(OpenAiProtocol.chatCompletionBody(
-                "abc", "deepseek-flash", "你好", new Usage(10, 20)));
+                "abc", "deepseek-flash", "你好", new Usage(10, 20), "stop"));
 
         assertEquals("chat.completion", node.get("object").asText());
         assertEquals("abc", node.get("id").asText());
@@ -52,12 +52,37 @@ class OpenAiProtocolTest {
         assertEquals("stop", choice.get("finish_reason").asText());
     }
 
+    /**
+     * F0 的核心回归点：finish_reason 必须**原样透传**。
+     *
+     * 这里曾经硬编码 "stop"，于是上游因预算耗尽返回的
+     * {@code finish_reason=length} + 空正文，会被网关报成"正常结束"。
+     * 客户端于是完全没有办法分辨"答案就是空的"和"被截断了" —— 比不返回该字段更坏。
+     */
+    @Test
+    void finishReasonIsPassedThroughNotHardcoded() throws Exception {
+        JsonNode node = json(OpenAiProtocol.chatCompletionBody(
+                "abc", "deepseek-flash", "", new Usage(33, 64), "length"));
+
+        assertEquals("length", node.get("choices").get(0).get("finish_reason").asText(),
+                "上游给的 length 必须原样出去，不能被美化成 stop");
+    }
+
+    @Test
+    void nullFinishReasonFallsBackToStop() throws Exception {
+        // 兜底只针对"上游没给"（缓存命中、流式快照这类网关自己合成的响应）。
+        JsonNode node = json(OpenAiProtocol.chatCompletionBody(
+                "abc", "m", "x", new Usage(1, 2), null));
+
+        assertEquals("stop", node.get("choices").get(0).get("finish_reason").asText());
+    }
+
     @Test
     void usageKeysAreSnakeCase() throws Exception {
         // 这一条是本次修复的核心：Java DTO 是 camelCase，
         // 一旦漏出去客户端读到的 prompt_tokens 就是 undefined/0。
         JsonNode usage = json(OpenAiProtocol.chatCompletionBody(
-                "abc", "m", "x", new Usage(11, 22))).get("usage");
+                "abc", "m", "x", new Usage(11, 22), null)).get("usage");
 
         assertEquals(11, usage.get("prompt_tokens").asInt());
         assertEquals(22, usage.get("completion_tokens").asInt());
@@ -67,7 +92,7 @@ class OpenAiProtocolTest {
     @Test
     void camelCaseUsageKeysNeverLeak() throws Exception {
         JsonNode usage = json(OpenAiProtocol.chatCompletionBody(
-                "abc", "m", "x", new Usage(1, 2))).get("usage");
+                "abc", "m", "x", new Usage(1, 2), null)).get("usage");
 
         assertFalse(usage.has("promptTokens"), "不允许出现 camelCase 的 promptTokens");
         assertFalse(usage.has("completionTokens"), "不允许出现 camelCase 的 completionTokens");
@@ -78,7 +103,7 @@ class OpenAiProtocolTest {
         // 规则 A：缓存命中只能走响应头。body 里出现 cacheHit
         // 就等于放弃"任何 OpenAI 客户端可直连"这个前提。
         JsonNode node = json(OpenAiProtocol.chatCompletionBody(
-                "abc", "m", "x", new Usage(1, 2)));
+                "abc", "m", "x", new Usage(1, 2), null));
 
         assertFalse(node.has("cacheHit"));
         assertFalse(node.has("cache_hit"));
@@ -87,7 +112,7 @@ class OpenAiProtocolTest {
     @Test
     void nullUsageFallsBackToZeros() throws Exception {
         JsonNode usage = json(OpenAiProtocol.chatCompletionBody(
-                "abc", "m", "x", null)).get("usage");
+                "abc", "m", "x", null, null)).get("usage");
 
         assertEquals(0, usage.get("prompt_tokens").asInt());
         assertEquals(0, usage.get("total_tokens").asInt());
@@ -96,14 +121,14 @@ class OpenAiProtocolTest {
     @Test
     void nullContentBecomesEmptyStringNotNull() throws Exception {
         // 客户端对 null content 的处理千奇百怪，统一给空串。
-        JsonNode node = json(OpenAiProtocol.chatCompletionBody("abc", "m", null, null));
+        JsonNode node = json(OpenAiProtocol.chatCompletionBody("abc", "m", null, null, null));
 
         assertEquals("", node.get("choices").get(0).get("message").get("content").asText());
     }
 
     @Test
     void blankIdGetsPlaceholder() throws Exception {
-        JsonNode node = json(OpenAiProtocol.chatCompletionBody(null, "m", "x", null));
+        JsonNode node = json(OpenAiProtocol.chatCompletionBody(null, "m", "x", null, null));
 
         assertEquals("chatcmpl-unknown", node.get("id").asText());
     }
@@ -117,7 +142,49 @@ class OpenAiProtocolTest {
         assertEquals("chat.completion.chunk", node.get("object").asText());
         JsonNode choice = node.get("choices").get(0);
         assertEquals("部分", choice.get("delta").get("content").asText());
-        assertTrue(choice.get("finish_reason").isNull(), "分片的 finish_reason 应为 null，终止由 [DONE] 表达");
+        assertTrue(choice.get("finish_reason").isNull(),
+                "文本分片的 finish_reason 必须为 null —— 流结束由收尾帧与 [DONE] 共同表达");
+    }
+
+    /**
+     * F0：流式也必须能把"被截断"告诉客户端。
+     *
+     * 收尾帧的形状是 {@code delta: {}}（空对象）+ 非 null 的 finish_reason。
+     * 不转发这个帧的话，流式路径上"正常结束"与"被 length 截断"长得一模一样：
+     * 用户只看到一个突然停住的答案，然后收到 [DONE]。
+     */
+    @Test
+    void finishChunkCarriesReasonWithEmptyDeltaObject() throws Exception {
+        JsonNode node = json(OpenAiProtocol.chatCompletionFinishChunk("cid", "m", "length"));
+
+        JsonNode choice = node.get("choices").get(0);
+        assertEquals("length", choice.get("finish_reason").asText());
+        assertTrue(choice.get("delta").isObject(), "delta 必须是空**对象**，不是 null");
+        assertEquals(0, choice.get("delta").size(), "收尾帧的 delta 里不能有任何字段");
+    }
+
+    @Test
+    void finishChunkNeverCarriesDeltaContent() throws Exception {
+        // 空 delta.content 分片在部分客户端上会被当成"又收到一段空回复"。
+        // 这正是收尾帧不复用 chatCompletionChunk 的原因。
+        JsonNode node = json(OpenAiProtocol.chatCompletionFinishChunk("cid", "m", "stop"));
+
+        assertFalse(node.get("choices").get(0).get("delta").has("content"));
+    }
+
+    @Test
+    void finishChunkNormalizesBlankReasonToStop() throws Exception {
+        JsonNode node = json(OpenAiProtocol.chatCompletionFinishChunk("cid", "m", ""));
+
+        assertEquals("stop", node.get("choices").get(0).get("finish_reason").asText());
+    }
+
+    @Test
+    void finishChunkCarriesNoUsageNode() throws Exception {
+        // 收尾帧与用量帧是两帧：客户端可能只要其一（include_usage 是可选的）。
+        JsonNode node = json(OpenAiProtocol.chatCompletionFinishChunk("cid", "m", "stop"));
+
+        assertFalse(node.has("usage"));
     }
 
     @Test

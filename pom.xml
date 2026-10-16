@@ -19,6 +19,14 @@
 
   <properties>
     <java.version>17</java.version>
+    <!--
+      byte-buddy 必须覆写：Spring Boot 3.3.4 默认管理 1.14.19，
+      而本机用 JDK 24 编译运行 —— 1.14.19 无法插桩 JDK 24 的类，
+      Mockito 直接报 "Could not modify all classes"（inline mock maker 失效）。
+      1.15.11 是本地仓库里第一个能用的版本。
+      仅影响测试期（mock 生成），不进运行时依赖。
+    -->
+    <byte-buddy.version>1.15.11</byte-buddy.version>
   </properties>
 
   <dependencies>

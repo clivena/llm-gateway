@@ -13,22 +13,39 @@ import com.llmgw.api.dto.Usage;
  *     ② 账本只能按字符数估算 token，成本在流式场景失真 —— 而流式恰恰是主战场。
  *   把这两个值随分片一起带出来，两条问题一次解决，不用各自再打补丁。
  *
- * @param model 实际服务本次请求的模型名（不是请求里写的那个）
- * @param delta 文本增量；用量帧为 null
- * @param usage 上游回传的真实用量；仅在有值时有意义
+ * @param model        实际服务本次请求的模型名（不是请求里写的那个）
+ * @param delta        文本增量；用量帧与收尾帧为 null
+ * @param usage        上游回传的真实用量；仅在有值时有意义
+ * @param finishReason 上游回传的 finish_reason；仅**收尾帧**有值（见 {@link #finish}）
  */
-public record StreamChunk(String model, String delta, Usage usage) {
+public record StreamChunk(String model, String delta, Usage usage, String finishReason) {
 
     public static StreamChunk delta(String model, String text) {
-        return new StreamChunk(model, text, null);
+        return new StreamChunk(model, text, null, null);
     }
 
     /** 用量帧：通常是 choices 为空、usage 非空的收尾帧。网关用它记账，不转发给客户端。 */
     public static StreamChunk usage(String model, Usage usage) {
-        return new StreamChunk(model, null, usage);
+        return new StreamChunk(model, null, usage, null);
+    }
+
+    /**
+     * 收尾帧：上游在流末尾发的那个"带 finish_reason、delta 为空"的分片。
+     *
+     * <p>F0 之前这类分片被当成"没有 content 的分片"直接丢掉，于是流式路径
+     * 同样存在与非流式一样的盲区：客户端看到 {@code [DONE]}，却不知道这次是
+     * 正常结束还是被 {@code length} 截断。**这个帧不能丢。**
+     */
+    public static StreamChunk finish(String model, String finishReason) {
+        return new StreamChunk(model, null, null, finishReason);
     }
 
     public boolean hasDelta() {
         return delta != null && !delta.isEmpty();
+    }
+
+    /** 是否是收尾帧（带 finish_reason）。 */
+    public boolean isFinish() {
+        return finishReason != null && !finishReason.isBlank();
     }
 }

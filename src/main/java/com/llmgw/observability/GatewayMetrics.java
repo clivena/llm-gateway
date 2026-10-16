@@ -1,5 +1,6 @@
 package com.llmgw.observability;
 
+import com.llmgw.core.protocol.UpstreamOutcome;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
@@ -8,17 +9,30 @@ import org.springframework.stereotype.Component;
 import java.time.Duration;
 
 /**
- * 关键指标。P7 补全后的全景：
+ * 关键指标。P7 补全 + F0 扩充后的全景：
  *
  * <pre>
- *   llmgw.cache.hit         缓存命中（含层归属见日志）
- *   llmgw.cache.miss        缓存未命中
- *   llmgw.cascade.escalate  级联升级次数
- *   llmgw.ledger.write      账本落库成功
- *   llmgw.ledger.failure    账本落库失败   ← 一涨就说明对账会缺数据
- *   llmgw.quota.rejected    配额拒绝（对应 429）
- *   llmgw.request.latency   延迟直方图，tag: model / stream / outcome
+ *   llmgw.cache.hit           缓存命中（含层归属见日志）
+ *   llmgw.cache.miss          缓存未命中
+ *   llmgw.cascade.escalate    级联升级次数
+ *   llmgw.ledger.write        账本落库成功
+ *   llmgw.ledger.failure      账本落库失败   ← 一涨就说明对账会缺数据
+ *   llmgw.quota.rejected      配额拒绝（对应 429）
+ *   llmgw.quota.settled       配额结算次数（reserve-then-settle 的第二段）
+ *   llmgw.quota.settle.failed 配额结算失败   ← 一涨就说明配额会系统性失真
+ *   llmgw.upstream.empty      上游返回空正文  ← F0 新增，见下
+ *   llmgw.upstream.truncated  上游 finish_reason=length（预算耗尽被截断）
+ *   llmgw.request.latency     延迟直方图，tag: model / stream
  * </pre>
+ *
+ * <h3>为什么 empty 与 truncated 必须分开计数（F0）</h3>
+ * 两者会同时出现（推理型模型的典型失败形态），但**单独出现时含义完全相反**：
+ * <ul>
+ *   <li>{@code empty} 单独涨 → 上游或模型行为异常，是**故障信号**，该告警。</li>
+ *   <li>{@code truncated} 单独涨 → 客户端把 {@code max_tokens} 设小了，
+ *       是**用量信号**，该去联系调用方而不是查上游。</li>
+ * </ul>
+ * 合在一个计数器里，这两种情况就永远分不开 —— 而它们的处置动作完全不同。
  *
  * <h3>为什么必须补延迟指标（P7）</h3>
  * 补之前，延迟<b>只能从 Postgres 账本里查</b>。这在两处致命：
@@ -33,7 +47,7 @@ import java.time.Duration;
  * 两种模式的 P99 会互相污染 —— 看到 P99 变差时无法判断是哪条路径退化了。
  *
  * <p>基数控制：model 取值来自配置（几个到几十个），stream 是布尔，
- * outcome 两种 —— 组合数可控，不会撑爆时序库。
+ * 组合数可控，不会撑爆时序库。
  */
 @Component
 public class GatewayMetrics {
@@ -45,6 +59,10 @@ public class GatewayMetrics {
     private final Counter ledgerWrite;
     private final Counter ledgerFailure;
     private final Counter quotaRejected;
+    private final Counter quotaSettled;
+    private final Counter quotaSettleFailed;
+    private final Counter upstreamEmpty;
+    private final Counter upstreamTruncated;
 
     public GatewayMetrics(MeterRegistry registry) {
         this.registry = registry;
@@ -56,6 +74,10 @@ public class GatewayMetrics {
         // 配额拒绝独立计数：/admin/status 与日志里能看到，但两者都不是可告警的时序数据。
         // "429 占比突然上升"是最该被自动发现的信号之一（要么有人在刷，要么额度设小了）。
         this.quotaRejected = Counter.builder("llmgw.quota.rejected").register(registry);
+        this.quotaSettled = Counter.builder("llmgw.quota.settled").register(registry);
+        this.quotaSettleFailed = Counter.builder("llmgw.quota.settle.failed").register(registry);
+        this.upstreamEmpty = Counter.builder("llmgw.upstream.empty").register(registry);
+        this.upstreamTruncated = Counter.builder("llmgw.upstream.truncated").register(registry);
     }
 
     public void onCacheHit() { cacheHit.increment(); }
@@ -64,6 +86,24 @@ public class GatewayMetrics {
     public void onLedgerWrite() { ledgerWrite.increment(); }
     public void onLedgerFailure() { ledgerFailure.increment(); }
     public void onQuotaRejected() { quotaRejected.increment(); }
+    public void onQuotaSettled() { quotaSettled.increment(); }
+    public void onQuotaSettleFailed() { quotaSettleFailed.increment(); }
+
+    /**
+     * 记一次上游响应的可用性。两个计数器各自独立递增 —— 两者都成立时
+     * 两个都加，因为它们表达的是两个不同的事实（"什么都没给" + "还被截断了"）。
+     */
+    public void onUpstreamOutcome(UpstreamOutcome outcome) {
+        if (outcome == null) {
+            return;
+        }
+        if (outcome.empty()) {
+            upstreamEmpty.increment();
+        }
+        if (outcome.truncated()) {
+            upstreamTruncated.increment();
+        }
+    }
 
     /**
      * 记录一次请求的端到端耗时。

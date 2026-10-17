@@ -54,9 +54,11 @@ public class CostLedgerService {
      *                与 feature <b>语义正交</b>：feature 回答"哪个业务在花钱"，
      *                task 回答"这笔钱是按什么能力需求花出去的"。
      *                两者都为空是合法的（老客户端不传 feature、任务路由关闭）。
+     * @param provider 实际服务这次请求的 provider 名（F2 之后同一 model 可能在多家部署，
+     *                 只记 model 就分不清是谁答的）。缓存命中传 "cache"。
      */
-    public void record(String traceId, String apiKey, String feature, String task, String model,
-                       boolean cacheHit, int promptTokens, int completionTokens,
+    public void record(String traceId, String apiKey, String feature, String task, String provider,
+                       String model, boolean cacheHit, int promptTokens, int completionTokens,
                        double cost, long latencyMs) {
 
         // trace_id 在表里是 NOT NULL：上游万一带了空值，这里必须兜住，
@@ -67,7 +69,7 @@ public class CostLedgerService {
         final String feat = feature == null ? "" : feature;
 
         if (properties.getCost().toPostgres()) {
-            repository.insert(tid, apiKey, feat, task, model, cacheHit,
+            repository.insert(tid, apiKey, feat, task, provider, model, cacheHit,
                             promptTokens, completionTokens, cost, latencyMs)
                     .subscribe(
                             rows -> metrics.onLedgerWrite(),
@@ -83,6 +85,7 @@ public class CostLedgerService {
             event.put("apiKey", apiKey);
             event.put("feature", feat);
             event.put("task", task);
+            event.put("provider", provider);
             event.put("model", model);
             event.put("cacheHit", cacheHit);
             event.put("promptTokens", promptTokens);

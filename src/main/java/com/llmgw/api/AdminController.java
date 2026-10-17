@@ -77,6 +77,17 @@ public class AdminController {
     }
 
     /**
+     * 账本按 provider 汇总：哪条链路在承载成本。
+     *
+     * <p>它是 {@code provider} 列真正被用到的地方。F2 之后同一个 model 可能在
+     * 多家部署，"备用那家接管了多少流量、花了多少钱"只按 model 汇总时会被并成一行。
+     */
+    @GetMapping("/ledger/by-provider")
+    public Flux<Map<String, Object>> byProvider() {
+        return ledger.summaryByProvider();
+    }
+
+    /**
      * 当前生效的任务路由：映射表 + 本进程的命中分布。
      *
      * <p>这个端点的存在理由与 {@code /admin/circuit} 相同：排障时人问的是

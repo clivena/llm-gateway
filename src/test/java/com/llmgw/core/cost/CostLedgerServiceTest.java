@@ -55,9 +55,9 @@ class CostLedgerServiceTest {
     @BeforeEach
     void setUp() {
         service = new CostLedgerService(kafka, repository, props, metrics);
-        // feature / task 用 any() 而不是 anyString()：task 允许为 null，
+        // feature / task / provider 用 any() 而不是 anyString()：后两者允许为 null，
         // 而 anyString() 不匹配 null —— 桩会静默不命中、返回 null，然后在 subscribe 处 NPE。
-        when(repository.insert(anyString(), anyString(), any(), any(), anyString(),
+        when(repository.insert(anyString(), anyString(), any(), any(), any(), anyString(),
                 anyBoolean(), anyInt(), anyInt(), anyDouble(), anyLong()))
                 .thenReturn(Mono.just(1L));
 
@@ -70,11 +70,29 @@ class CostLedgerServiceTest {
     void taskIsPassedToThePostgresRow() {
         props.getCost().setSink("postgres");
 
-        service.record("trace-1", "tenant-a", "resume-builder", "code",
+        service.record("trace-1", "tenant-a", "resume-builder", "code", "provider-a",
                 "deepseek-flash", false, 41, 576, 0.0008845, 1200);
 
-        verify(repository).insert("trace-1", "tenant-a", "resume-builder", "code",
+        verify(repository).insert("trace-1", "tenant-a", "resume-builder", "code", "provider-a",
                 "deepseek-flash", false, 41, 576, 0.0008845, 1200L);
+    }
+
+    /**
+     * provider 与 model 是两个维度：F2 之后同一个 model 可能在多家部署，
+     * 只把 model 传下去时，"这次到底是主链路答的还是备用链路接管的"就再也无法回答。
+     *
+     * <p>这里只钉"原样透传"；真正写入库的那一步由真机脚本验。
+     */
+    @Test
+    void providerIsPassedToThePostgresRowSeparatelyFromModel() {
+        props.getCost().setSink("postgres");
+
+        // 故意让 model 相同、provider 不同：若实现把两者混成一个字段，这条会露馅。
+        service.record("trace-p", "tenant-a", "resume-builder", "chat", "provider-b",
+                "deepseek-flash", false, 3, 7, 0.001, 88);
+
+        verify(repository).insert("trace-p", "tenant-a", "resume-builder", "chat", "provider-b",
+                "deepseek-flash", false, 3, 7, 0.001, 88L);
     }
 
     /**
@@ -88,10 +106,10 @@ class CostLedgerServiceTest {
     void absentTaskStaysNullSoGroupingDoesNotInventABucket() {
         props.getCost().setSink("postgres");
 
-        service.record("trace-2", "tenant-a", null, null,
+        service.record("trace-2", "tenant-a", null, null, "provider-a",
                 "deepseek-flash", false, 1, 1, 0.0, 10);
 
-        verify(repository).insert(eq("trace-2"), eq("tenant-a"), eq(""), isNull(),
+        verify(repository).insert(eq("trace-2"), eq("tenant-a"), eq(""), isNull(), eq("provider-a"),
                 eq("deepseek-flash"), eq(false), eq(1), eq(1), eq(0.0), eq(10L));
     }
 
@@ -101,11 +119,13 @@ class CostLedgerServiceTest {
         props.getCost().setSink("kafka");
         ArgumentCaptor<String> payload = ArgumentCaptor.forClass(String.class);
 
-        service.record("trace-3", "tenant-a", "resume-builder", "summarize",
+        service.record("trace-3", "tenant-a", "resume-builder", "summarize", "provider-a",
                 "deepseek-pro", false, 10, 20, 0.001, 300);
 
         verify(kafka).send(eq(CostLedgerService.TOPIC), eq("tenant-a"), payload.capture());
         assertTrue(payload.getValue().contains("\"task\":\"summarize\""),
                 "事件里必须有 task，实际：" + payload.getValue());
+        assertTrue(payload.getValue().contains("\"provider\":\"provider-a\""),
+                "事件里必须有 provider（否则下游无法按链路归因），实际：" + payload.getValue());
     }
 }

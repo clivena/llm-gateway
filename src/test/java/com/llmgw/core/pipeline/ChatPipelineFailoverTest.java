@@ -40,9 +40,13 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyDouble;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -160,6 +164,28 @@ class ChatPipelineFailoverTest {
     }
 
     // --- 基本转移 ---
+
+    /**
+     * 账本必须记下"真正答的那一家"（P7）。
+     *
+     * <p>为什么这个断言不能省：转移之后 {@code model} 是不变的（同一个模型在两个部署上），
+     * 所以"这一行账是谁花的"在 model 维度上**根本看不出来**。
+     * 记错成链首那家会更糟 —— 它会让人以为主力链路一直正常，
+     * 而实际上所有流量都已经被踢到了备用链路。
+     */
+    @Test
+    void ledgerRecordsTheProviderThatActuallyServed() {
+        when(adapterA.chat(eq(MODEL), any())).thenReturn(Mono.error(serverError()));
+        when(adapterB.chat(eq(MODEL), any())).thenReturn(Mono.just(answer("B 的答案")));
+
+        StepVerifier.create(pipeline.execute(KEY, request(), "trace-p7"))
+                .expectNextMatches(r -> "B 的答案".equals(r.content()))
+                .verifyComplete();
+
+        verify(ledger, timeout(2000).atLeastOnce()).record(
+                eq("trace-p7"), eq(KEY), any(), eq("chat"), eq(PROVIDER_B), eq(MODEL), eq(false),
+                anyInt(), anyInt(), anyDouble(), anyLong());
+    }
 
     /**
      * 主力挂掉 → 备选透明接管，客户端看到的是 200 + 备选的答案。

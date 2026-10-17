@@ -12,9 +12,10 @@
   6. 显式 model + task     → 以 model 为准（不因任务替换用户点名的模型）
   7. 流式                  → 分片里的 model 就是路由结果
   8. 指标                  → llmgw_route_task_total 带 task / source 标签
-  9. 响应头                → X-Route-Task / X-Route-Source（非流式 + 流式）
- 10. 账本                  → cost_ledger.task 真的按请求写进去（不是恒 NULL）
- 11. 运维端点              → /admin/route 同时给出映射表与命中分布
+ 9. 响应头                → X-Route-Task / X-Route-Source（非流式 + 流式）
+10. 账本（非流式）        → cost_ledger 的 task / provider 真的按请求写进去（不是恒 NULL）
+11. 账本（流式）          → 流式路径同样记 provider（两条路径取值的时机不同，要分别验）
+12. 运维端点              → /admin/route 映射表+命中分布；/admin/ledger/by-provider 可按链路归因
 
 第 5 条尤其重要：实现里路由是**同步**解析的，若异常没有转成 Mono.error /
 Flux.error，它就不会进控制器的 onErrorResume，客户端会收到 500 而不是 400 ——
@@ -22,10 +23,13 @@ Flux.error，它就不会进控制器的 onErrorResume，客户端会收到 500 
 
 第 10 条同样只有真机能验：列加了、SQL 改了，但绑参漏了或绑成空串，
 单测里看到的只是"调用了一个方法"，只有数据库里的那一行能证明它真的写对了。
+provider 一起验的理由：账本里"哪家答的"是从真正执行的那一步取的，
+写错成常量、或与 model 混成一个字段，只有在 model 相同 provider 不同的场景下才暴露。
 
 前置依赖：Redis（配额走 Redis + Lua，没有开关）+ Postgres（G4 要读账本）。
   docker compose up -d
   已有库需要先应用迁移：db/migrations/001-cost-ledger-task.sql
+                          db/migrations/002-cost-ledger-provider.sql
 
 用法：
   python scripts/check-task-routing.py
@@ -54,6 +58,9 @@ FLASH = "stub-flash"
 PRO = "stub-pro"
 
 RESULTS = []
+# 断言条数下限。改脚本时新增/删除断言要同步改这个数 —— 它的作用不是记账，
+# 而是让"某一段被跳过"这件事从静默通过变成红色失败。
+EXPECTED_CASES = 15
 NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -326,6 +333,29 @@ def hget(headers, name):
     return None
 
 
+def wait_ledger_row(trace_id, timeout=10.0):
+    """等这一条 trace 对应的账本行出现。
+
+    落账是异步的（订阅后写库、流式还要等 onComplete），所以必须轮询。
+    用 traceId 匹配而不是"取最新一行"：后者在并发下会验到别人的账，
+    而且分不清"这次写对了"和"上一次碰巧写对了"。
+    """
+    if not trace_id:
+        return None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for r in get_json("/admin/ledger/recent?limit=50"):
+            if r.get("trace_id") == trace_id:
+                return r
+        time.sleep(0.4)
+    return None
+
+
+def ledger_view(row):
+    keys = ("task", "provider", "model")
+    return {k: row.get(k) for k in keys} if row else None
+
+
 def record(name, ok, detail):
     RESULTS.append((name, ok, detail))
     log("  %s %s —— %s" % ("PASS" if ok else "FAIL", name, detail))
@@ -467,7 +497,7 @@ def run_cases():
            status == 200 and task_h == "code",
            "HTTP=%s task=%s" % (status, task_h))
 
-    # G4：账本 task 列。用**这次响应的 traceId** 去库里找那一行 ——
+    # G4 / G6：账本。用**这次响应的 traceId** 去库里找那一行 ——
     # 这比"看最新一行"强得多：它同时证明了响应与账本属于同一次请求，
     # 以及 task 是跟着这次判定走的，而不是碰巧被上一条请求写进去的。
     # （第一次实现用 id 递增做判据，而 /admin/ledger/recent 当时不返回 id，
@@ -475,25 +505,34 @@ def run_cases():
     try:
         status, _, headers = ask_headers("帮我重构一下这段逻辑", task="code")
         trace_id = hget(headers, "X-Trace-Id")
+        row = wait_ledger_row(trace_id)
 
-        row = None
-        deadline = time.time() + 10
-        while time.time() < deadline and trace_id:
-            rows = [r for r in get_json("/admin/ledger/recent?limit=50")
-                    if r.get("trace_id") == trace_id]
-            if rows:
-                row = rows[0]
-                break
-            time.sleep(0.4)
-
-        record("G4 账本按请求写入 task 列",
+        # provider 与 task / model 一起断言：它是 P7 的落点。model 相同、provider 不同的
+        # 情况下，只验 model 会看不出账本到底记没记"是哪家答的"。
+        record("G4 账本按请求写入 task / provider 列（非流式）",
                status == 200 and row is not None
-               and row.get("task") == "code" and row.get("model") == PRO,
-               "trace=%s 行=%s" % (trace_id,
-                                   {k: row.get(k) for k in ("task", "model")} if row else None))
+               and row.get("task") == "code" and row.get("model") == PRO
+               and row.get("provider") == "stub",
+               "trace=%s 行=%s" % (trace_id, ledger_view(row)))
     except Exception as e:
-        record("G4 账本按请求写入 task 列", False,
+        record("G4 账本按请求写入 task / provider 列（非流式）", False,
                "读取失败：%r（/admin/ledger/recent 依赖 Postgres）" % (e,))
+
+    # G6：流式也要记 provider。它不是 G4 的重复 —— 两条路径取 provider 的时机不同：
+    # 非流式在拿到响应体的那一刻就知道是谁答的；流式根本拿不到"响应对象"，
+    # 只能在开始拉流时记下 adapter 名。只验非流式，等于把一半实现留在未验证状态。
+    try:
+        status, _, headers = ask_headers("```java\nint a = 1;\n```", task="code", stream=True)
+        trace_id = hget(headers, "X-Trace-Id")
+        row = wait_ledger_row(trace_id)
+
+        record("G6 流式账本同样写入 provider / task",
+               status == 200 and row is not None
+               and row.get("task") == "code" and row.get("provider") == "stub"
+               and row.get("model") == PRO,
+               "trace=%s 行=%s" % (trace_id, ledger_view(row)))
+    except Exception as e:
+        record("G6 流式账本同样写入 provider / task", False, "读取失败：%r" % (e,))
 
     # G5：/admin/route。它必须同时给出"配置生效成什么样"和"实际命中分布"，
     # 只回显配置是不够的 —— 排障要回答的是"现在到底在往哪边倒"。
@@ -514,6 +553,20 @@ def run_cases():
                   hits.get("code")))
     except Exception as e:
         record("G5 /admin/route 给出映射表与命中分布", False, "读取失败：%r" % (e,))
+
+    # G7：按 provider 归因的聚合端点。它存在的意义只有一个 ——
+    # F2 之后同一个 model 可能在多家部署，"备用那家接管了多少流量"这个问题
+    # 用 model 维度回答不了。所以这里验的是"有 stub 这一行且 calls > 0"，
+    # 顺带把 task / model 维度之外的第二条归因轴打通。
+    try:
+        rows = get_json("/admin/ledger/by-provider")
+        stub_row = next((r for r in rows if r.get("provider") == "stub"), None)
+        record("G7 /admin/ledger/by-provider 能按链路归因",
+               stub_row is not None and int(stub_row.get("calls") or 0) > 0,
+               "providers=%s stub=%s"
+               % ([r.get("provider") for r in rows], stub_row))
+    except Exception as e:
+        record("G7 /admin/ledger/by-provider 能按链路归因", False, "读取失败：%r" % (e,))
 
 
 def main():
@@ -547,6 +600,16 @@ def main():
         stub.shutdown()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
+
+    # 条数下限：判据 passed == len(RESULTS) 只能保证"跑了的都通过"，
+    # 保证不了"该跑的都跑了"。上一轮 check-failover 就栽在这里 ——
+    # 分段启动失败被静默 return None，汇总照样打印"全部通过"。
+    if len(RESULTS) < EXPECTED_CASES:
+        log()
+        log("[失败] 只跑了 %d 条断言，少于预期 %d 条 —— 有段落被跳过。"
+            % (len(RESULTS), EXPECTED_CASES))
+        return 1
+
     log()
     log("=" * 72)
     log("结果：%d/%d PASS" % (passed, len(RESULTS)))

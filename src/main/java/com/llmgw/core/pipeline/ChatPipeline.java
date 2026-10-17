@@ -170,7 +170,8 @@ public class ChatPipeline {
                                 // 不变量 A：命中同样要落账，但必须异步。
                                 // 旧实现这里是同步 ledger.record —— 命中本来是最快的路径，
                                 // 却在 Kafka 不可达时白等 max.block.ms，把优化点变成新瓶颈。
-                                recordAsync(traceId, apiKey, request, route.task(), payload, 0.0, latency);
+                                recordAsync(traceId, apiKey, request, route.task(), "cache",
+                                        payload, 0.0, latency);
                                 // 结算（F0）：缓存命中 = 完全没走上游 = 真实用量为 0。
                                 // 预扣的那笔必须**全额退还** —— 否则命中一次反而白扣一次配额，
                                 // 而"命中就省钱"正是缓存存在的全部理由。
@@ -217,7 +218,7 @@ public class ChatPipeline {
                     return cacheService.lookup(namespace, question)
                             .flatMapMany(hit -> {
                                 metrics.onCacheHit();
-                                recordAsync(traceId, apiKey, request, route.task(),
+                                recordAsync(traceId, apiKey, request, route.task(), "cache",
                                         new ChatResponse("cache", "cache", hit.answer(),
                                                 new Usage(0, 0), true),
                                         0.0, 0);
@@ -263,8 +264,17 @@ public class ChatPipeline {
         // 整个请求共用一个（含级联升级那一段），理由同 spentTokens 的注释。
         DiscardedAttempts discarded = new DiscardedAttempts(traceId, apiKey, request,
                 route.task(), tier, spentTokens);
+        // 最终是哪家 provider 服务了这次请求（P7）。
+        // 为什么不能在事后推：F2 之后同一个 model 可能在多家 provider 上都有部署，
+        // "model=deepseek-flash" 反推不出是哪一家 —— 而故障期最想知道的就是这个
+        // （"备用那家接管之后，延迟和答案质量变了吗"）。
+        // 用 AtomicReference 而不是返回值，理由同 RouteTrace：它是随链路前进的事实，
+        // 不是某一次调用的输出。最后一次写入就是交付给客户端的那次。
+        // 命名与流式路径保持一致（servedByProvider）：本类里 servedBy 专指**模型名**
+        // （它会被级联升级改写），provider 用 servedByProvider，两者绝不混用。
+        AtomicReference<String> servedByProvider = new AtomicReference<>();
 
-        return callWithFailover(tier.model(), request, discarded)
+        return callWithFailover(tier.model(), request, discarded, servedByProvider)
                 .flatMap(response -> {
                     // F0：先判定"上游到底给了什么"，再谈怎么处理。
                     UpstreamOutcome outcome = UpstreamOutcome.of(response.content(), response.finishReason());
@@ -282,7 +292,7 @@ public class ChatPipeline {
                         // usageOrEstimate 只在真实值缺失时才回退。
                         Usage firstUsage = usageOrEstimate(request, response);
                         spentTokens.addAndGet(firstUsage.total());
-                        recordAsync(traceId, apiKey, request, route.task(),
+                        recordAsync(traceId, apiKey, request, route.task(), servedByProvider.get(),
                                 new ChatResponse(response.id(), tier.model(), response.content(),
                                         firstUsage, false, response.finishReason()),
                                 estimateCost(tier.model(), tier, firstUsage),
@@ -292,7 +302,7 @@ public class ChatPipeline {
                         // 升级后的这一次同样走重试 + 熔断 + 转移 —— 用的是**另一家** provider
                         // 的熔断器（按 provider 名分实例）。这正是 F2 要利用的形状：
                         // 便宜那家的熔断器打开了，不代表升级目标那家也不健康。
-                        return callWithFailover(stronger.model(), request, discarded)
+                        return callWithFailover(stronger.model(), request, discarded, servedByProvider)
                                 .map(upgraded -> new ChatResponse(upgraded.id(), stronger.model(),
                                         upgraded.content(), upgraded.usage(), false,
                                         upgraded.finishReason()));
@@ -316,7 +326,7 @@ public class ChatPipeline {
                             ? response
                             : new ChatResponse(response.id(), response.model(), response.content(),
                                     usage, response.cacheHit(), response.finishReason());
-                    recordAsync(traceId, apiKey, request, route.task(), ledgerRow,
+                    recordAsync(traceId, apiKey, request, route.task(), servedByProvider.get(), ledgerRow,
                             estimateCost(response.model(), tier, usage), latency);
                     if (!response.cacheHit()) {
                         // 不变量 B：缓存段按"实际服务的模型"划，不用请求档位划，
@@ -364,7 +374,8 @@ public class ChatPipeline {
      *                 调用方不指定时用配置里的 {@code retry.max-attempts}。
      */
     private Mono<ChatResponse> callUpstream(ProviderAdapter adapter, String model, ChatRequest request,
-                                            int attempts, DiscardedAttempts discarded) {
+                                            int attempts, DiscardedAttempts discarded,
+                                            AtomicReference<String> servedByProvider) {
         // ★ Mono.defer 不是多余的包装，它是"重试 = 真的再发一次请求"这句承诺的实现。
         // adapter.chat() 返回的是一条**冷** Publisher，每次订阅才会真正出网；
         // 但"冷"是当前 OpenAiAdapter 的实现细节，不是 ProviderAdapter 接口的契约。
@@ -382,11 +393,16 @@ public class ChatPipeline {
             return adapter.chat(model, request);
         })
                 .map(resp -> {
+                    // 先记"谁答的"，再判定答案能不能用：
+                    // 空正文也是一次真实的上游交付（钱花了），它的 provider 同样要留证。
+                    // 若这次随后被重试/转移丢弃，DiscardedAttempts 会用自己的 provider 落账；
+                    // 若它是最终答案，外层读到的就是这个值。
+                    servedByProvider.set(adapter.name());
                     if (UpstreamOutcome.of(resp.content(), resp.finishReason()).empty()) {
                         // 先登记再抛：这份响应已经有 usage 了（钱已经花了），
                         // 但最终会不会被重试丢掉，此刻还不知道。登记之后由
                         // "下一次尝试开始"或 terminal 的 adopt 来定它是哪种。
-                        discarded.hold(resp);
+                        discarded.hold(resp, adapter.name());
                         throw new UpstreamEmptyResponseException(resp);
                     }
                     return resp;
@@ -448,16 +464,18 @@ public class ChatPipeline {
      * 无论链路怎么坏。故障期的账单能算出来，比多给备选一次重试重要得多。
      */
     private Mono<ChatResponse> callWithFailover(String model, ChatRequest request,
-                                                DiscardedAttempts discarded) {
+                                                DiscardedAttempts discarded,
+                                                AtomicReference<String> servedByProvider) {
         List<ProviderAdapter> chain = providers.candidatesFor(model);
         int limit = failoverLimit(chain);
         AtomicInteger budget = new AtomicInteger(totalAttemptBudget());
-        return attemptChain(chain, limit, 0, budget, model, request, discarded);
+        return attemptChain(chain, limit, 0, budget, model, request, discarded, servedByProvider);
     }
 
     private Mono<ChatResponse> attemptChain(List<ProviderAdapter> chain, int limit, int idx,
                                             AtomicInteger budget, String model, ChatRequest request,
-                                            DiscardedAttempts discarded) {
+                                            DiscardedAttempts discarded,
+                                            AtomicReference<String> servedByProvider) {
         int i = nextCallable(chain, idx, limit, model);
         if (i < 0) {
             return Mono.error(UpstreamCircuitOpenException.allCandidatesUnavailable(
@@ -473,7 +491,7 @@ public class ChatPipeline {
         //    顺手把 circuit.rejected 记到那些根本没轮到它上场的 provider 头上；
         // ② 挑不到下一个候选时应当把**原始错误**上抛，而不是换成一个
         //    "全部不可用"的新错误 —— 后者会把"上游真的报了 500"这个事实抹掉。
-        return callUpstream(adapter, model, request, attempts, discarded)
+        return callUpstream(adapter, model, request, attempts, discarded, servedByProvider)
                 .onErrorResume(e -> {
                     if (budgetSpent) {
                         return terminal(e, discarded);
@@ -491,7 +509,7 @@ public class ChatPipeline {
                     metrics.onFailover(adapter.name(), to.name());
                     log.warn("failing over [model={} from={} to={}]: {}",
                             model, adapter.name(), to.name(), e.toString());
-                    return attemptChain(chain, limit, next, budget, model, request, discarded);
+                    return attemptChain(chain, limit, next, budget, model, request, discarded, servedByProvider);
                 });
     }
 
@@ -527,7 +545,11 @@ public class ChatPipeline {
         private final String task;
         private final ModelTier tier;
         private final AtomicLong spentTokens;
-        private final AtomicReference<ChatResponse> pending = new AtomicReference<>();
+        private final AtomicReference<Held> pending = new AtomicReference<>();
+
+        /** 一次"已收到、可能被丢弃"的响应，连同它是哪家 provider 给的。 */
+        private record Held(ChatResponse response, String provider) {
+        }
 
         DiscardedAttempts(String traceId, String apiKey, ChatRequest request, String task,
                           ModelTier tier, AtomicLong spentTokens) {
@@ -539,9 +561,14 @@ public class ChatPipeline {
             this.spentTokens = spentTokens;
         }
 
-        /** 登记"已收到、可能被丢弃"的响应。 */
-        void hold(ChatResponse response) {
-            pending.set(response);
+        /**
+         * 登记"已收到、可能被丢弃"的响应。
+         *
+         * <p>provider 必须一起登记：转移之后，光看 model 已经分不清这行账是哪家花的钱
+         * （同一个 model 可能在多家 provider 上都有部署）。
+         */
+        void hold(ChatResponse response, String provider) {
+            pending.set(new Held(response, provider));
         }
 
         /**
@@ -552,17 +579,17 @@ public class ChatPipeline {
          * 口径是"整条请求"，两者不该混）。
          */
         void settleSuperseded() {
-            ChatResponse stale = pending.getAndSet(null);
+            Held stale = pending.getAndSet(null);
             if (stale == null) {
                 return;
             }
-            Usage usage = usageOrEstimate(request, stale);
-            double cost = estimateCost(stale.model(), tier, usage);
-            recordAsync(traceId, apiKey, request, task, stale, cost, 0);
+            Usage usage = usageOrEstimate(request, stale.response());
+            double cost = estimateCost(stale.response().model(), tier, usage);
+            recordAsync(traceId, apiKey, request, task, stale.provider(), stale.response(), cost, 0);
             spentTokens.addAndGet(usage.total());
-            log.warn("upstream attempt discarded by retry/failover and billed [model={} "
+            log.warn("upstream attempt discarded by retry/failover and billed [provider={} model={} "
                             + "finish_reason={} usage={}]",
-                    stale.model(), stale.finishReason(), usage);
+                    stale.provider(), stale.response().model(), stale.response().finishReason(), usage);
         }
 
         /** 最终答案就是这条登记过的响应 —— 它会被正常路径落账，这里只撤掉待定标记。 */
@@ -587,16 +614,19 @@ public class ChatPipeline {
      * 所以这个 AtomicBoolean 必须<b>跨整个请求</b>共用，包括级联升级那一段。
      */
     private Flux<StreamChunk> streamWithFailover(String model, ChatRequest request,
-                                                 AtomicBoolean upstreamProduced) {
+                                                 AtomicBoolean upstreamProduced,
+                                                 AtomicReference<String> servedByProvider) {
         List<ProviderAdapter> chain = providers.candidatesFor(model);
         int limit = failoverLimit(chain);
         AtomicInteger budget = new AtomicInteger(totalAttemptBudget());
-        return attemptStreamChain(chain, limit, 0, budget, model, request, upstreamProduced);
+        return attemptStreamChain(chain, limit, 0, budget, model, request, upstreamProduced,
+                servedByProvider);
     }
 
     private Flux<StreamChunk> attemptStreamChain(List<ProviderAdapter> chain, int limit, int idx,
                                                  AtomicInteger budget, String model,
-                                                 ChatRequest request, AtomicBoolean upstreamProduced) {
+                                                 ChatRequest request, AtomicBoolean upstreamProduced,
+                                                 AtomicReference<String> servedByProvider) {
         int i = nextCallable(chain, idx, limit, model);
         if (i < 0) {
             return Flux.error(UpstreamCircuitOpenException.allCandidatesUnavailable(
@@ -609,7 +639,11 @@ public class ChatPipeline {
                 // Flux.defer 的理由同 callUpstream：把"每次重试/转移都重新发起一次
                 // 流式调用"写成代码里的承诺，而不是依赖适配器的"冷 Publisher"这个实现细节。
                 Flux.defer(() -> adapter.chatStream(model, request)),
-                upstreamProduced, attempts);
+                upstreamProduced, attempts)
+                // 订阅即记录：流式拿不到"响应对象"，能确定"是哪家"的时刻只有开始拉流。
+                // 若这条流在产出任何分片前失败并转移，下一条流会覆盖成新的 provider ——
+                // 最后一次写入正好是真正把内容交付给客户端的那家。
+                .doOnSubscribe(s -> servedByProvider.set(adapter.name()));
         return attempt.onErrorResume(e -> {
             // ★ 闸门：只要有任何一帧到达过客户端，就绝不许换 provider。
             // 判断依据用 upstreamProduced（任何帧都算）而不是 emitted（只有正文帧算）：
@@ -629,7 +663,8 @@ public class ChatPipeline {
             metrics.onFailover(adapter.name(), to.name());
             log.warn("failing over stream [model={} from={} to={}]: {}",
                     model, adapter.name(), to.name(), e.toString());
-            return attemptStreamChain(chain, limit, next, budget, model, request, upstreamProduced);
+            return attemptStreamChain(chain, limit, next, budget, model, request, upstreamProduced,
+                    servedByProvider);
         });
     }
 
@@ -690,6 +725,10 @@ public class ChatPipeline {
         // 级联升级后实际服务的是更强的模型，账本与响应分片都必须记真实模型名，
         // 否则会出现"按便宜模型计价"的归因错误、以及客户端看到错的模型。
         AtomicReference<String> servedBy = new AtomicReference<>(tier.model());
+        // 实际服务这次请求的 provider（P7）。与上面的 servedBy 分开：
+        // 一个是模型名（会因级联升级变化），一个是提供方（会因故障转移变化），
+        // 两者可以各自独立地变 —— 合成一个"servedBy"字符串就再也拆不开了。
+        AtomicReference<String> servedByProvider = new AtomicReference<>();
         // 上游末帧的真实用量。拿不到时才回退估算（F4）。
         AtomicReference<Usage> upstreamUsage = new AtomicReference<>();
         // 上游的收尾帧给的原因（F0）。流式同样需要它 —— 否则客户端看到 [DONE]
@@ -707,7 +746,8 @@ public class ChatPipeline {
         // 因此被重试丢弃的那次尝试产出的分片不会被算进来。
         AtomicBoolean upstreamProduced = new AtomicBoolean(false);
 
-        Flux<StreamChunk> primary = streamWithFailover(tier.model(), request, upstreamProduced)
+        Flux<StreamChunk> primary = streamWithFailover(tier.model(), request, upstreamProduced,
+                servedByProvider)
                 .doOnNext(chunk -> collect(chunk, emitted, collected, upstreamUsage, finishReason));
 
         Flux<StreamChunk> body = primary
@@ -724,7 +764,8 @@ public class ChatPipeline {
                             // 升级后的流同样走重试 + 熔断 + 转移，用那家 provider 自己的熔断器。
                             // 复用同一个 upstreamProduced：便宜那家一个分片都没给出来过，
                             // 所以闸门在这里仍然是开的 —— 这正是我们还能升级的前提。
-                            return streamWithFailover(stronger.model(), request, upstreamProduced)
+                            return streamWithFailover(stronger.model(), request, upstreamProduced,
+                                    servedByProvider)
                                     .doOnNext(chunk -> collect(chunk, emitted, collected,
                                             upstreamUsage, finishReason));
                         }))
@@ -749,7 +790,7 @@ public class ChatPipeline {
 
                     ChatResponse snapshot = new ChatResponse("stream", model, collected.toString(),
                             usage, false, finishReason.get());
-                    recordAsync(traceId, apiKey, request, route.task(), snapshot,
+                    recordAsync(traceId, apiKey, request, route.task(), servedByProvider.get(), snapshot,
                             estimateCost(model, tier, usage), latency);
                     writeCache(cacheNamespace(apiKey, model), question, collected.toString());
                     settleAmount.set(usage.total());
@@ -982,10 +1023,10 @@ public class ChatPipeline {
      * 有一次已知会阻塞的 Kafka 调用，需要把它隔离出去。
      */
     private void recordAsync(String traceId, String apiKey, ChatRequest request, String task,
-                             ChatResponse response, double cost, long latencyMs) {
+                             String provider, ChatResponse response, double cost, long latencyMs) {
         Usage u = response.usage() == null ? new Usage(0, 0) : response.usage();
         Mono.fromRunnable(() -> ledger.record(traceId, apiKey, request.feature(), task,
-                        response.model(), response.cacheHit(), u.promptTokens(),
+                        provider, response.model(), response.cacheHit(), u.promptTokens(),
                         u.completionTokens(), cost, latencyMs))
                 .subscribeOn(Schedulers.boundedElastic())
                 .subscribe(null, e -> log.debug("cost ledger failed: {}", e.getMessage()));

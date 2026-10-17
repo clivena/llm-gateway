@@ -223,9 +223,10 @@ python scripts/run-gateway-smoke.py
 | POST | `/v1/chat/completions` | OpenAI 兼容对话接口，支持 `stream: true`（SSE 逐字返回） |
 | GET | `/admin/status` | 依赖健康（Redis / Postgres）+ 当前生效策略 |
 | GET | `/admin/pricing` | 计费单价表 + 路由策略——面板上"为什么是这个价"的依据 |
-| GET | `/admin/ledger/recent?limit=` | 账本明细（limit 收口 1~200，避免被当全表导出用；含 `task` 列） |
+| GET | `/admin/ledger/recent?limit=` | 账本明细（limit 收口 1~200，避免被当全表导出用；含 `task` / `provider` 列） |
 | GET | `/admin/ledger/summary` | 账本按租户汇总（对账口径） |
 | GET | `/admin/ledger/by-task` | 账本按**任务**汇总：哪个任务在花钱（`NULL` 显示为 `(none)`） |
+| GET | `/admin/ledger/by-provider` | 账本按**链路**汇总：钱付给了谁、备用那家接管了多少（`NULL` 显示为 `(none)`，缓存命中为 `cache`） |
 | GET | `/admin/quota/{apiKey}` | 指定租户当前周期的配额用量 |
 | GET | `/admin/circuit` | 各 provider 的重试 / 熔断状态与失败率（F1；F2 之后也是"为什么转移了"的第一诊断入口） |
 | GET | `/admin/route` | 当前生效的任务映射表（含真实档位）+ 本进程 `task × source` 命中分布 |
@@ -493,7 +494,7 @@ A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来�
 
 ### 任务路由验证（按 task 选模型）
 
-**单元测试**：`mvn -o clean test` → **200 passed**（F3 交付时 175 → step-22 +11 → step-23 +14）。
+**单元测试**：`mvn -o clean test` → **202 passed**（F3 交付时 175 → step-22 +11 → step-23 +14 → P7 +2）。
 
 | 层面 | 断言 |
 |---|---|
@@ -502,8 +503,9 @@ A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来�
 | 启动校验 | `default-task` 未声明、task 的 model 不在 candidates、enabled 但表为空、`classifier` 取值非法、`policy=TASK_BASED` 已被删除 |
 | 编排 | 非流式与流式**都**用 `route.tier()`；缓存段跟着模型走；未知任务 → 400（且必须是**流内错误**）；指标真的写了 |
 | 留证（R2） | 回执两条路径都写 / 失败时留空；响应头真的发出（含流式）；非 ASCII 降级；账本 task 透传到仓储与 Kafka；`/admin/route` 用运行时档位 |
+| 归因（P7） | 账本记的是**真正答话那家**（A 500 → B 接管时必须是 B）；provider 与 model 各自独立透传；Kafka 事件带 provider |
 
-**真机**：`scripts/check-task-routing.py` —— **13/13 PASS**（A~F 段 8 条 + step-23 新增 G 段 5 条）。
+**真机**：`scripts/check-task-routing.py` —— **15/15 PASS**（A~F 段 8 条 + G 段 7 条）。
 
 > 交付 F3 时这一节写的是"未实跑"：容器起不来（Docker Desktop 被沙箱安全策略阻止，
 > 禁 `wsl.exe` 且不可绕过）。后来容器恢复正常，补跑结果如上 —— 没有把没跑过的
@@ -513,8 +515,10 @@ A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来�
 ✓ G1 非流式响应头带 X-Route-Task / X-Route-Source
 ✓ G2 推断来源可区分（inferred 而不是 explicit）
 ✓ G3 流式响应头同样带路由结果
-✓ G4 账本按请求写入 task 列
+✓ G4 账本按请求写入 task / provider 列（非流式）
+✓ G6 流式账本同样写入 provider / task
 ✓ G5 /admin/route 给出映射表与命中分布
+✓ G7 /admin/ledger/by-provider 能按链路归因
 ```
 
 复跑：`docker compose up -d && python scripts/check-task-routing.py`
@@ -527,6 +531,10 @@ G4 同理：它用**这次响应的 `traceId`** 去库里找那一行，
 同时证明"响应与账本属于同一次请求"和"task 跟着这次判定走"。
 第一版用"账本 id 递增"做判据，而 `/admin/ledger/recent` 的 SELECT 里没有 `id` ——
 判据恒假、断言恒失败（见 step-23 第 6 节）。
+
+**G6 不是 G4 的重复**：非流式在拿到响应体那一刻就知道是谁答的；
+流式根本拿不到"响应对象"，只能在开始拉流时记下 adapter 名。
+两条路径的实现完全不同，只验一条等于把另一半留在未验证状态。
 
 ### 复查修复（step-22）
 
@@ -719,7 +727,17 @@ G4 同理：它用**这次响应的 `traceId`** 去库里找那一行，
     两者用途不同，不要把两个数合成一个"总命中"。
 42. **已有数据库必须手动应用 migration**：`db/schema.sql` 挂在 initdb 下，
     **只在数据目录为空时执行**。只改 schema.sql 会让现有环境写账本时静默失败
-    （异常被吞成 warn）。见 `db/migrations/001-cost-ledger-task.sql`。
+    （异常被吞成 warn）。见 `db/migrations/001-cost-ledger-task.sql` 与 `002-cost-ledger-provider.sql`。
+43. ~~**账本没有 `provider` 列**~~ → **已做（P7）**：`cost_ledger.provider` 记**实际服务这次请求的那家**，
+    与 `model` 是两列 —— 级联升级改 model 不改 provider，故障转移改 provider 不改 model。
+    流式与非流式取 provider 的时机不同（`.map` vs `doOnSubscribe`），分别实现、分别验证。
+44. **`provider` 记的是 adapter 的配置名**，不是上游返回的任何标识。若某家 provider 背后还是网关，
+    真实后端是谁本网关不知道、也不该猜。
+45. **全链路失败时账本不记**（没有 `usage` 可记）。所以"某家挂了"在 `/admin/ledger/by-provider`
+    里表现为"它没出现"，而不是"它有 0 次"——两者的区别排查时要心里有数。
+46. **`(none)` 桶会一直存在**：那是 P7 加列之前的账，**不做 backfill**。
+    用 `model` 反推回去更糟——F2 之后一个 model 可能对多家，反推值一半是错的，且错得看起来很合理。
+47. **`/admin/ledger/by-provider` 没有时间窗口参数**，是全量聚合。要"最近 7 天"得直接写 SQL。
 
 ---
 
@@ -774,6 +792,7 @@ G4 同理：它用**这次响应的 `traceId`** 去库里找那一行，
 | [21](./docs/step-21-task-based-routing.md) | **按任务选模型**：三层判定 + 规则分类器 + 任务映射表 + 开关只能有一个 |
 | [22](./docs/step-22-review-fixes-2.md) | **复查修复**：4xx 不再熔断 provider + 被丢弃的尝试也记账 + 流式收尾帧 + 计价档位 |
 | [23](./docs/step-23-r2-observability.md) | **R2 留证**：路由响应头（RouteTrace）+ 账本 `task` 列 + `/admin/route`；顺带修掉脚本"假绿" |
+| [24](./docs/step-24-provider-attribution.md) | **B 批 P7 链路归因**：账本 `provider` 列 + `/admin/ledger/by-provider`；流式与非流式分别取 provider |
 
 ---
 

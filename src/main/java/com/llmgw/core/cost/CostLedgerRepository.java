@@ -29,10 +29,10 @@ public class CostLedgerRepository {
 
     private static final String INSERT_SQL = """
             INSERT INTO cost_ledger
-              (trace_id, api_key, feature, task, model, cache_hit,
+              (trace_id, api_key, feature, task, provider, model, cache_hit,
                prompt_tokens, completion_tokens, cost, latency_ms)
             VALUES
-              (:traceId, :apiKey, :feature, :task, :model, :cacheHit,
+              (:traceId, :apiKey, :feature, :task, :provider, :model, :cacheHit,
                :promptTokens, :completionTokens, :cost, :latencyMs)
             """;
 
@@ -41,8 +41,12 @@ public class CostLedgerRepository {
      *             任务路由关闭时为 null —— 那表示"没有发生任务判定"，
      *             与"判定成 chat"是两件不同的事实，不能都用字符串占位符表示，
      *             否则按 task 分组统计时会出现一个假的 {@code n/a} 桶。
+     * @param provider 实际服务这次请求的 provider。缓存命中为 "cache"。
+     *                 它和 model 是两个维度：F2 之后同一个 model 可能在多家部署，
+     *                 只记 model 时"备用链路接管之后质量/延迟有没有变"无法回答。
      */
-    public Mono<Long> insert(String traceId, String apiKey, String feature, String task, String model,
+    public Mono<Long> insert(String traceId, String apiKey, String feature, String task,
+                             String provider, String model,
                              boolean cacheHit, int promptTokens, int completionTokens,
                              double cost, long latencyMs) {
         DatabaseClient.GenericExecuteSpec spec = db.sql(INSERT_SQL)
@@ -56,10 +60,12 @@ public class CostLedgerRepository {
                 .bind("completionTokens", completionTokens)
                 .bind("cost", BigDecimal.valueOf(cost))
                 .bind("latencyMs", (int) latencyMs);
-        // task 绑真正的 NULL 而不是空串：按任务分组统计时，空串会变成
-        // 一个"叫空字符串的任务"的桶，而 NULL 才能被 GROUP BY 正确归组，
+        // task / provider 绑真正的 NULL 而不是空串：按任一维度分组统计时，
+        // 空串会变成一个"叫空字符串的任务/提供方"的桶，而 NULL 才能被 GROUP BY 正确归组，
         // 也才能和"判定成 chat"区分开。
         spec = task == null ? spec.bindNull("task", String.class) : spec.bind("task", task);
+        spec = provider == null ? spec.bindNull("provider", String.class)
+                : spec.bind("provider", provider);
         return spec.fetch().rowsUpdated();
     }
 
@@ -102,10 +108,31 @@ public class CostLedgerRepository {
                 .fetch().all();
     }
 
+    /**
+     * 按 provider 对账：哪家链路在承载成本。
+     *
+     * <p>与 {@link #summaryByTask()} 是同一条理由的两面：F2 之后同一个 model
+     * 可能在多家部署，故障期最该能回答"备用那家接管了多少流量、花了多少钱"。
+     * 只按 model 汇总时，这两家会被并成一行。
+     */
+    public Flux<Map<String, Object>> summaryByProvider() {
+        return db.sql("""
+                        SELECT COALESCE(provider, '(none)') AS provider,
+                               count(*)                AS calls,
+                               sum(prompt_tokens)      AS prompt_tokens,
+                               sum(completion_tokens)  AS completion_tokens,
+                               round(sum(cost), 6)     AS total_cost
+                        FROM cost_ledger
+                        GROUP BY COALESCE(provider, '(none)')
+                        ORDER BY total_cost DESC
+                        """)
+                .fetch().all();
+    }
+
     /** 明细，按时间倒序。 */
     public Flux<Map<String, Object>> recent(int limit) {
         return db.sql("""
-                        SELECT trace_id, api_key, feature, task, model, cache_hit,
+                        SELECT trace_id, api_key, feature, task, provider, model, cache_hit,
                                prompt_tokens, completion_tokens, cost, latency_ms, created_at
                         FROM cost_ledger
                         ORDER BY id DESC

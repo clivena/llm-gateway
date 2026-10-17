@@ -3,6 +3,9 @@
 按步骤记录了这个网关从工程底座到真机验证的完整过程。
 每篇固定结构：**目标 / 改动 / 关键代码 / 验证方式 / 结果 / 踩了什么坑 / 下一步**。
 
+> 第一次读，建议先看 [项目全景](./project-overview.md)：为什么做、架构思路、制作流程、中间件取舍。
+> 那篇不是步骤记录，是对整个项目的一次复盘。
+
 | 步骤 | 内容 | 文档 |
 |---|---|---|
 | 01 | 工程底座：WebClient / 配置绑定 / Redis / Kafka | [step-01](./step-01-gateway-bootstrap.md) |
@@ -22,8 +25,9 @@
 | 19 | **重试与熔断**：Resilience4j 算子嵌套 + 流式重试闸门 + 失败路径配额结算（F1） | [step-19](./step-19-retry-and-circuit-breaker.md) |
 | 20 | **跨 provider 故障转移**：候选链 + 请求级预算 + 流式闸门跨 provider 共享（F2） | [step-20](./step-20-cross-provider-failover.md) |
 | 21 | **按任务选模型**：三层判定 + 规则分类器 + 任务映射表 + 开关只能有一个 | [step-21](./step-21-task-based-routing.md) |
+| 22 | **复查修复**：4xx 不再熔断 provider + 被丢弃的尝试也记账 + 流式收尾帧 + 计价档位 | [step-22](./step-22-review-fixes-2.md) |
 
-> 16~21 均已成篇。14 号步骤当时未单独成篇，内容并入 [step-15](./step-15-review-fixes.md)。
+> 16~22 均已成篇。14 号步骤当时未单独成篇，内容并入 [step-15](./step-15-review-fixes.md)。
 > 当前状态与已知边界见 [README 的已知边界](../README.md#已知边界诚实清单)。
 
 ---
@@ -50,6 +54,8 @@
 | [step-16](./step-16-reactive-multi-provider.md) | `forModel(model)` 是唯一的模型→适配器查找入口 | **已扩展**：新增 `candidatesFor(model)` 返回候选链，`forModel` 变成取链首。需要"只想挑一家"的地方语义不变（见 [step-20](./step-20-cross-provider-failover.md)） |
 | [step-03](./step-03-chat-pipeline.md) | `RoutingPolicy.TASK_BASED` 是"按任务选模型"的入口 | **已删除**：它的实现只是 `candidates.get(0)`（占位），从没接过任务信息，也零测试。任务路由是"先判任务再查表"的**前置判定**，不是候选表上的一种排序方式；保留它等于让 `policy` 与 `task-routing.enabled` 两个开关表达同一件事（见 [step-21](./step-21-task-based-routing.md)） |
 | [step-19](./step-19-retry-and-circuit-breaker.md) | 空正文的重试耗尽后，在 `callUpstream` 内部还原成原始响应 | **位置已挪走**：还原必须在整条候选链的**末端**（`terminal`）。在单次调用内部还原等于把空正文变成一个成功值，外层再没机会问下一家——F2 的 `emptyAnswerTriggersFailover` 第一次跑就是这样红的（见 [step-20](./step-20-cross-provider-failover.md)） |
+| [step-19](./step-19-retry-and-circuit-breaker.md) / [step-20](./step-20-cross-provider-failover.md) | 重试的中间尝试不落账，"每次尝试单独落账"列为待办 | **已修**：被重试/转移丢弃的尝试各自落账并计入配额，判据是"下一次尝试开始"（见 [step-22](./step-22-review-fixes-2.md)）。流式仍不补——拿不到 usage |
+| [step-20](./step-20-cross-provider-failover.md) | 4xx 会计入熔断窗口，应配 `ignoreException(...)` | **已修**：4xx（429 除外）既不算成功也不算失败。否则一个坏客户端连发参数错误就能把健康 provider 熔断，所有租户一起 503 |
 
 ---
 

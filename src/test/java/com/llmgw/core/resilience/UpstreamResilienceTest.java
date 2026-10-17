@@ -290,6 +290,67 @@ class UpstreamResilienceTest {
                 "maxAttempts=3 + minimumNumberOfCalls=3：一次失败请求就够打开熔断器");
     }
 
+    // --- 熔断的失败口径：哪些错误该算 provider 的账 ---
+
+    /**
+     * <b>客户端错误不能把 provider 熔断掉。</b>
+     *
+     * <p>这是本项目里"一个坏客户端可以下线整条模型链路"的那条路径：
+     * 上游回 400 说明网关替它发出去的请求本身不合法（参数写错、字段不支持），
+     * 跟这家 provider 健康不健康毫无关系。若把它记进滑动窗口，
+     * 连发 {@code minimumNumberOfCalls} 次参数错误就足以让熔断开到 OPEN，
+     * 之后所有租户的正常请求一起收 503，而且连"参数错了"这个真实原因都看不到。
+     *
+     * <p>断言用"计数仍在增长"而不是只看状态，是因为状态可能是 CLOSED
+     * 而调用其实已经被短路（例如 HALF_OPEN 的探针限制）。两个一起断言才封得住。
+     */
+    @Test
+    void clientErrorsDoNotOpenTheCircuit() {
+        props.getResilience().getRetry().setEnabled(false);
+        resilience = new UpstreamResilience(props, new GatewayMetrics(new SimpleMeterRegistry()));
+
+        AtomicInteger attempts = new AtomicInteger();
+        Mono<String> badRequest = Mono.fromCallable(() -> {
+            attempts.incrementAndGet();
+            throw status(400);
+        });
+
+        // 打满一个窗口（3）再多一倍：没有 ignoreException 时第 3 次就会 OPEN 并短路
+        for (int i = 0; i < 6; i++) {
+            StepVerifier.create(resilience.protect(PROVIDER, badRequest)).expectError().verify();
+        }
+
+        assertEquals(6, attempts.get(),
+                "6 次 400 必须每一次都真的发出去了 —— 被短路说明熔断已经打开");
+        assertEquals(CircuitBreaker.State.CLOSED, resilience.stateOf(PROVIDER),
+                "客户端错误不该影响 provider 的失败率");
+    }
+
+    /**
+     * 429 是例外：它虽然也是 4xx，但说的是"我现在服务不了你"，
+     * 是 provider 侧的容量信号。持续 429 打开熔断、把流量让给下一家，
+     * 正是故障转移该做的事 —— 所以 {@code clientError} 必须把它排除在外。
+     */
+    @Test
+    void rateLimitStillCountsTowardTheCircuit() {
+        props.getResilience().getRetry().setEnabled(false);
+        resilience = new UpstreamResilience(props, new GatewayMetrics(new SimpleMeterRegistry()));
+
+        AtomicInteger attempts = new AtomicInteger();
+        Mono<String> rateLimited = Mono.fromCallable(() -> {
+            attempts.incrementAndGet();
+            throw status(429);
+        });
+
+        for (int i = 0; i < 3; i++) {
+            StepVerifier.create(resilience.protect(PROVIDER, rateLimited)).expectError().verify();
+        }
+
+        assertEquals(3, attempts.get());
+        assertEquals(CircuitBreaker.State.OPEN, resilience.stateOf(PROVIDER),
+                "429 是容量信号，不该被当成客户端错误忽略");
+    }
+
     // --- 流式：重试闸门 ---
 
     /**

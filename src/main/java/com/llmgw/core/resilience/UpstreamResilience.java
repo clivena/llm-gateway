@@ -153,6 +153,10 @@ public class UpstreamResilience {
                 // 也如实反映"等待期已过、正在试探"；关掉的话状态只在下次调用时才推进，
                 // 面板会一直显示 OPEN，看起来像永远不恢复。
                 .automaticTransitionFromOpenToHalfOpenEnabled(true)
+                // 4xx 不算 provider 的账（见 clientError 的说明）。
+                // 不配这一行时，一个把 max_tokens 写成负数的客户端连发 N 次 400，
+                // 就能把一家完全健康的 provider 熔断掉 —— 整条模型队列随之下线。
+                .ignoreException(UpstreamResilience::clientError)
                 .build());
     }
 
@@ -312,6 +316,42 @@ public class UpstreamResilience {
         metrics.onCircuitRejected(provider);
         log.warn("circuit breaker open, request not sent upstream [provider={}]", provider);
         return new UpstreamCircuitOpenException(provider, cause);
+    }
+
+    /**
+     * 哪些失败<b>不该算到 provider 头上</b>（不进熔断窗口）。
+     *
+     * <p>Resilience4j 默认把每个异常都记成一次失败。这在"故障都来自上游"的假设下成立，
+     * 而网关不满足这个假设：<b>请求是网关替客户端发出去的</b>，上游回的 400
+     * 往往恰恰说明"客户端传的参数不对"（`max_tokens` 写成负数、模型不支持某个字段）。
+     * 把它记到 provider 的失败率上，后果不是"多算了一点"：
+     *
+     * <pre>
+     *   一个客户端连发 9 次参数错误的请求
+     *     → 这家 provider 的滑动窗口被打满
+     *     → 熔断打开
+     *     → 所有租户、所有模型、所有正常请求一起 503
+     * </pre>
+     *
+     * 也就是说：<b>一个坏客户端可以凭一己之力把整条模型链路下线</b>，
+     * 而且熔断打开后连"这个参数确实错了"的错误信息都拿不到了 —— 只剩 503。
+     * 这类"用健康信号去响应客户端的错误"是熔断器最典型的误用。
+     *
+     * <h3>为什么 429 不在此列</h3>
+     * 429 虽然也是 4xx，但它说的是"<b>现在别来</b>"，是 provider 侧的容量信号，
+     * 不是请求本身有问题。持续 429 说明这家确实服务不了我们，打开熔断
+     * 让流量转移正是它该做的事。所以谓词写成"4xx 且不是 429"，
+     * 而不是笼统的 {@code is4xxClientError()}。
+     *
+     * <p>注意被忽略的异常<b>既不算成功也不算失败</b>：它不改善失败率，也不恶化。
+     * 这正是我们要的语义 —— "这条链路好不好"和"这次请求合不合法"是两件事。
+     */
+    static boolean clientError(Throwable e) {
+        if (e instanceof WebClientResponseException w) {
+            return w.getStatusCode().is4xxClientError()
+                    && w.getStatusCode().value() != 429;
+        }
+        return false;
     }
 
     /**

@@ -201,8 +201,17 @@ public class ChatPipeline {
                                 // 注意这里是 flatMapMany：退还完成后再把分片发出去，
                                 // 保证"流结束 ⇒ 配额已结清"这个不变量成立。
                                 // 模型名标记为 cache：客户端能从分片里看出这次没走上游。
+                                //
+                                // ★ 必须补收尾帧，不能只发 delta。
+                                // 走上游的流在末帧一定带 finish_reason（F0），而缓存命中
+                                // 只发一个 delta 的话，客户端拿到的是一条**没有收尾帧**的流：
+                                // 累积 finish_reason 的实现（截断检测、JSON 输出是否完整）
+                                // 只能得到 null，与"走上游但被截断"无法区分。
+                                // 语义上 stop 是对的：网关交出去的是一份完整答案。
                                 return settleQuota(apiKey, estimatedTokens, 0)
-                                        .thenMany(Flux.just(StreamChunk.delta("cache", hit.answer())));
+                                        .thenMany(Flux.just(
+                                                StreamChunk.delta("cache", hit.answer()),
+                                                StreamChunk.finish("cache", "stop")));
                             })
                             .switchIfEmpty(Flux.defer(() -> {
                                 // 非流式分支里有 onCacheMiss，流式分支曾经漏了 ——
@@ -226,8 +235,11 @@ public class ChatPipeline {
         // 不变量 C 说"两次调用就有两份费用"，那就该有两份 token 计入配额 ——
         // 账本与配额两个口径必须一致，否则对不上账时不知道信哪个。
         AtomicLong spentTokens = new AtomicLong(0);
+        // 被重试 / 转移丢弃的尝试：它们同样真的花了钱，必须各自落一条账（不变量 C）。
+        // 整个请求共用一个（含级联升级那一段），理由同 spentTokens 的注释。
+        DiscardedAttempts discarded = new DiscardedAttempts(traceId, apiKey, request, tier, spentTokens);
 
-        return callWithFailover(tier.model(), request)
+        return callWithFailover(tier.model(), request, discarded)
                 .flatMap(response -> {
                     // F0：先判定"上游到底给了什么"，再谈怎么处理。
                     UpstreamOutcome outcome = UpstreamOutcome.of(response.content(), response.finishReason());
@@ -255,7 +267,7 @@ public class ChatPipeline {
                         // 升级后的这一次同样走重试 + 熔断 + 转移 —— 用的是**另一家** provider
                         // 的熔断器（按 provider 名分实例）。这正是 F2 要利用的形状：
                         // 便宜那家的熔断器打开了，不代表升级目标那家也不健康。
-                        return callWithFailover(stronger.model(), request)
+                        return callWithFailover(stronger.model(), request, discarded)
                                 .map(upgraded -> new ChatResponse(upgraded.id(), stronger.model(),
                                         upgraded.content(), upgraded.usage(), false,
                                         upgraded.finishReason()));
@@ -318,24 +330,38 @@ public class ChatPipeline {
      * 那正是 F0 刚刚修掉的"把被截断伪装成正常结束"的镜像错误：
      * 这次是把"上游明确说明了原因"伪装成"网关坏了"。
      *
-     * <p>还要注意<b>重试的每一次尝试都会真的花钱</b>。当前实现只为"最终交给客户端的那次"
-     * 落账（不变量 C 的账本口径），重试中间那几次的用量没有进账本 ——
-     * 见 docs/step-19 的已知边界，这是刻意留的取舍。
+     * <p>还要注意<b>重试的每一次尝试都会真的花钱</b>。只为"最终交给客户端的那次"落账
+     * 会让故障期的成本被系统性低估 —— 一次请求最多 4 次上游调用，账本却只有 1 行。
+     * 现在由 {@link DiscardedAttempts} 补齐：拿到响应却没被交付的那些尝试
+     * 各自落一条账，并计入配额（不变量 C / E）。
      *
      * @param attempts 本次允许的总尝试次数（含首次），F2 由故障转移的预算分配决定。
      *                 调用方不指定时用配置里的 {@code retry.max-attempts}。
      */
     private Mono<ChatResponse> callUpstream(ProviderAdapter adapter, String model, ChatRequest request,
-                                            int attempts) {
+                                            int attempts, DiscardedAttempts discarded) {
         // ★ Mono.defer 不是多余的包装，它是"重试 = 真的再发一次请求"这句承诺的实现。
         // adapter.chat() 返回的是一条**冷** Publisher，每次订阅才会真正出网；
         // 但"冷"是当前 OpenAiAdapter 的实现细节，不是 ProviderAdapter 接口的契约。
         // 万一将来有人写出一个会复用/缓存内部 Publisher 的适配器，
         // 重试就会变成"把上一次的旧响应再吐一遍"—— 看起来重试成功了，
         // 实际上一次请求都没发出去，而且没有任何报错。defer 把契约写进代码里。
-        Mono<ChatResponse> attempt = Mono.defer(() -> adapter.chat(model, request))
+        //
+        // defer 里还有一件事：**结算上一次被丢弃的尝试**。
+        // 能执行到这里，说明重试算子又订阅了一次，也就证明了上一次拿到的响应
+        // 没有被交付给任何人 —— 它是真的被丢弃了，该落账。
+        // "下一次尝试开始"是这里唯一可靠的判据：拿到响应的那一刻还无法知道
+        // 会不会重试，而等整个请求结束再判断，又分不清哪一次成了最终答案。
+        Mono<ChatResponse> attempt = Mono.defer(() -> {
+            discarded.settleSuperseded();
+            return adapter.chat(model, request);
+        })
                 .map(resp -> {
                     if (UpstreamOutcome.of(resp.content(), resp.finishReason()).empty()) {
+                        // 先登记再抛：这份响应已经有 usage 了（钱已经花了），
+                        // 但最终会不会被重试丢掉，此刻还不知道。登记之后由
+                        // "下一次尝试开始"或 terminal 的 adopt 来定它是哪种。
+                        discarded.hold(resp);
                         throw new UpstreamEmptyResponseException(resp);
                     }
                     return resp;
@@ -359,12 +385,17 @@ public class ChatPipeline {
      * 外层再没有机会问下一家 —— 一个"换个部署就能拿到正常答案"的请求
      * 于是被当成"上游明确说了它答不出"直接交付给客户端。
      */
-    private static Mono<ChatResponse> terminal(Throwable e) {
+    private Mono<ChatResponse> terminal(Throwable e, DiscardedAttempts discarded) {
         if (e instanceof UpstreamEmptyResponseException empty) {
             // 重试与转移都试过了，上游仍然只给出空正文 —— 这时必须把那份**原始响应**
             // 交还给上层，而不是 502。少了这一步，客户端会从
             // "200 + finish_reason=length + 空正文"退化成"网关坏了"，
             // 那正是 F0 修掉的错误的镜像版本。
+            //
+            // 这份响应**不是被丢弃的**：它就是最终交给客户端的那个，
+            // 会由正常路径落一条账。所以这里要把"待定"标记撤掉，
+            // 否则它会被记两次（一次按丢弃、一次按最终）。
+            discarded.adopt();
             return Mono.just(empty.response());
         }
         return Mono.error(e);
@@ -391,15 +422,17 @@ public class ChatPipeline {
      * <b>任何一次请求的上游调用次数都不会超过 {@code max-total-attempts}</b>，
      * 无论链路怎么坏。故障期的账单能算出来，比多给备选一次重试重要得多。
      */
-    private Mono<ChatResponse> callWithFailover(String model, ChatRequest request) {
+    private Mono<ChatResponse> callWithFailover(String model, ChatRequest request,
+                                                DiscardedAttempts discarded) {
         List<ProviderAdapter> chain = providers.candidatesFor(model);
         int limit = failoverLimit(chain);
         AtomicInteger budget = new AtomicInteger(totalAttemptBudget());
-        return attemptChain(chain, limit, 0, budget, model, request);
+        return attemptChain(chain, limit, 0, budget, model, request, discarded);
     }
 
     private Mono<ChatResponse> attemptChain(List<ProviderAdapter> chain, int limit, int idx,
-                                            AtomicInteger budget, String model, ChatRequest request) {
+                                            AtomicInteger budget, String model, ChatRequest request,
+                                            DiscardedAttempts discarded) {
         int i = nextCallable(chain, idx, limit, model);
         if (i < 0) {
             return Mono.error(UpstreamCircuitOpenException.allCandidatesUnavailable(
@@ -415,26 +448,100 @@ public class ChatPipeline {
         //    顺手把 circuit.rejected 记到那些根本没轮到它上场的 provider 头上；
         // ② 挑不到下一个候选时应当把**原始错误**上抛，而不是换成一个
         //    "全部不可用"的新错误 —— 后者会把"上游真的报了 500"这个事实抹掉。
-        return callUpstream(adapter, model, request, attempts)
+        return callUpstream(adapter, model, request, attempts, discarded)
                 .onErrorResume(e -> {
                     if (budgetSpent) {
-                        return terminal(e);
+                        return terminal(e, discarded);
                     }
                     if (!UpstreamResilience.failoverable(e)) {
                         // 确定性错误（4xx / 配额 / 参数非法）：换一家会拿到一模一样的错误，
                         // 转移只是把同一份失败再买一次。直接上抛，让错误如实到达客户端。
-                        return terminal(e);
+                        return terminal(e, discarded);
                     }
                     int next = nextCallable(chain, i + 1, limit, model);
                     if (next < 0) {
-                        return terminal(e);
+                        return terminal(e, discarded);
                     }
                     ProviderAdapter to = chain.get(next);
                     metrics.onFailover(adapter.name(), to.name());
                     log.warn("failing over [model={} from={} to={}]: {}",
                             model, adapter.name(), to.name(), e.toString());
-                    return attemptChain(chain, limit, next, budget, model, request);
+                    return attemptChain(chain, limit, next, budget, model, request, discarded);
                 });
+    }
+
+    /**
+     * 被重试 / 转移丢弃的尝试 —— 它们的钱真的花了，但不会成为最终答案。
+     *
+     * <h3>为什么需要单独的判据</h3>
+     * 上游回了一个响应（带 usage），但这个响应最终没有被交付给客户端：可能是空正文触发了
+     * 重试，也可能是这家坏了换了下一家。不变量 C 说"每一次真实发生的上游调用都要落一条账"，
+     * 所以这些尝试必须各自落账 —— 否则一次请求 4 次上游调用、账本只有 1 行，
+     * 成本在故障期被系统性低估，而故障期恰恰是账单最难看的时候。
+     *
+     * <h3>判据为什么是"下一次尝试开始"</h3>
+     * 拿到响应的那一刻还不知道会不会重试，所以只能先 {@link #hold} 住；
+     * 等重试算子重新订阅（{@code Mono.defer} 再次执行）时，才算证明"上一次没有被交付"。
+     * 如果最终没有再重试，那这条响应会由 {@link #adopt} 认领为最终答案，
+     * 由正常路径落账 —— 两条路互斥，不会重复记账。
+     *
+     * <h3>为什么不做成全局的"每次尝试都立即落账"</h3>
+     * 那样每一次订阅都要写一条账，包括**成功交付**的那一次，于是正常的单次请求
+     * 也会写两行（一次按尝试、一次按最终）。判据放在"是否被取代"上，
+     * 才能保证"一次请求的账本行数 = 真实上游调用次数"这个可以直接对账的口径。
+     *
+     * <p>只在非流式路径使用：流式拿不到被丢弃尝试的 usage（末帧没到就断了），
+     * 没有可记的数字；流式的用量口径见 {@code streamDispatch}。
+     */
+    private final class DiscardedAttempts {
+
+        private final String traceId;
+        private final String apiKey;
+        private final ChatRequest request;
+        /** 请求级的档位，仅在"模型不在候选表里"时作为计价兜底。 */
+        private final ModelTier tier;
+        private final AtomicLong spentTokens;
+        private final AtomicReference<ChatResponse> pending = new AtomicReference<>();
+
+        DiscardedAttempts(String traceId, String apiKey, ChatRequest request,
+                          ModelTier tier, AtomicLong spentTokens) {
+            this.traceId = traceId;
+            this.apiKey = apiKey;
+            this.request = request;
+            this.tier = tier;
+            this.spentTokens = spentTokens;
+        }
+
+        /** 登记"已收到、可能被丢弃"的响应。 */
+        void hold(ChatResponse response) {
+            pending.set(response);
+        }
+
+        /**
+         * 下一次尝试即将开始 → 上一次登记的响应确认被丢弃，落账并计入配额。
+         *
+         * <p>延迟记 0：单次尝试的耗时没有单独计时，而这一行的作用是成本，
+         * 不是延迟分析（延迟由 {@code metrics.recordLatency} 单独统计，
+         * 口径是"整条请求"，两者不该混）。
+         */
+        void settleSuperseded() {
+            ChatResponse stale = pending.getAndSet(null);
+            if (stale == null) {
+                return;
+            }
+            Usage usage = usageOrEstimate(request, stale);
+            double cost = estimateCost(stale.model(), tier, usage);
+            recordAsync(traceId, apiKey, request, stale, cost, 0);
+            spentTokens.addAndGet(usage.total());
+            log.warn("upstream attempt discarded by retry/failover and billed [model={} "
+                            + "finish_reason={} usage={}]",
+                    stale.model(), stale.finishReason(), usage);
+        }
+
+        /** 最终答案就是这条登记过的响应 —— 它会被正常路径落账，这里只撤掉待定标记。 */
+        void adopt() {
+            pending.set(null);
+        }
     }
 
     /**
@@ -690,14 +797,34 @@ public class ChatPipeline {
         return apiKey + ":" + model;
     }
 
-    private double estimateCost(String model, ModelTier tier, Usage usage) {
-        // 优先用配置的真实单价（输入/输出分开计）——否则账本会全是 0，
-        // 成本归因就成了空话。没有配单价的模型才回退到 ModelTier 的粗略估算。
+    /**
+     * 一次调用的成本。优先用配好的单价（输入/输出分开计），没有才回退到档位的粗略单价。
+     *
+     * <p>★ 回退时必须按<b>实际服务的模型</b>去查档位，不能用调用方手上的 tier。
+     * 级联升级之后这两者已经不是一回事：{@code tier} 是"请求开始时选的便宜档"，
+     * 而 {@code model} 是"最终服务的那家强模型"。拿旧 tier 兜底会让升级后的那次调用
+     * 按便宜模型计价 —— 成本被系统性低估，而升级恰恰发生在"便宜的答不好"的场景，
+     * 也就是账本最需要准的地方。而且这种错不会报错，只会在月底对账时表现为
+     * "总比账单少一点"，很难追到这一行。
+     *
+     * <p>只有模型不在候选表里（客户端显式指定了一个未纳入路由的模型）时，
+     * 才退回调用方给的那个档位 —— 那时它是唯一可用的信息。
+     *
+     * <p>包级可见是为了让计费口径能被直接断言：账本写入走的是
+     * {@code recordAsync}（fire-and-forget + 独立线程），从测试里等它落下来本身就是
+     * 不可靠的；而"算得对不对"和"写得进不进得去"是两件事，该分开验。
+     */
+    double estimateCost(String model, ModelTier tier, Usage usage) {
         GatewayProperties.Price price = properties.getPricing().get(model);
         if (price != null) {
             return price.costOf(usage.promptTokens(), usage.completionTokens());
         }
-        return usage.total() / 1000.0 * tier.costPer1k();
+        double per1k = properties.getRouter().getCandidates().stream()
+                .filter(c -> model.equals(c.getModel()))
+                .mapToDouble(GatewayProperties.Candidate::getCostPer1k)
+                .findFirst()
+                .orElse(tier.costPer1k());
+        return usage.total() / 1000.0 * per1k;
     }
 
     /**

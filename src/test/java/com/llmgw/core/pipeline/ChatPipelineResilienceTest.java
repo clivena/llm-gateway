@@ -265,11 +265,16 @@ class ChatPipelineResilienceTest {
     // --- 级联升级 + 失败的组合 ---
 
     /**
-     * 级联升级时第二次调用失败：结算必须用<b>第一次调用的真实用量</b>。
+     * 级联升级时第二次调用失败：结算必须覆盖<b>第一次调用真实花掉的每一次尝试</b>。
      *
      * <p>这是"不变量 C（两次调用两份费用）"与"不变量 D（失败路径也要结算）"
      * 交叉出来的那个格子。用 reserved 代替真实用量会错一次，
      * 用 0 会把第一次已经花掉的钱整个抹掉。
+     *
+     * <p>★ step-22 之后口径变了：第一次调用是空正文，重试了 3 次，
+     * <b>每次都是真实计费</b>，所以结算的是 3 × (11+22) = 99。
+     * 在此之前这里只记 33 —— 那正是"中间尝试不入账本"那个缺陷的样子：
+     * 数字看起来合理（33 确实是单次用量），只是这次请求实际花了三倍的钱。
      */
     @Test
     void escalationFollowedByFailureSettlesWithTheFirstCallsRealUsage() {
@@ -285,8 +290,8 @@ class ChatPipelineResilienceTest {
                 .verify();
 
         List<Long> settled = verifySettle();
-        assertEquals(List.of(33L), settled,
-                "第一次调用真实花了 11+22=33，必须照扣；用 reserved 或 0 都不对");
+        assertEquals(List.of(99L), settled,
+                "空正文重试 3 次，每次 11+22=33 → 99；只记 33 正是被修掉的低估");
     }
 
     /** 收集所有 settle 调用的 actual，按调用顺序返回。 */

@@ -88,6 +88,8 @@ class ChatPipelineFailoverTest {
     private final GatewayMetrics metrics = new GatewayMetrics(new SimpleMeterRegistry());
 
     private ChatPipeline pipeline;
+    /** 保留引用：有个用例要绕过管线直接把某家的熔断器打到 OPEN。 */
+    private UpstreamResilience resilience;
 
     private static final String KEY = "tenant-a";
     private static final String MODEL = "shared-model";
@@ -129,8 +131,9 @@ class ChatPipelineFailoverTest {
     }
 
     private void buildPipeline() {
+        resilience = new UpstreamResilience(props, metrics);
         pipeline = new ChatPipeline(quotaService, cacheService, routerService, providers,
-                ledger, metrics, props, estimator, new UpstreamResilience(props, metrics));
+                ledger, metrics, props, estimator, resilience);
     }
 
     private ChatRequest request() {
@@ -287,9 +290,10 @@ class ChatPipelineFailoverTest {
      * 根本不出网，但仍然会按分配额扣掉预算，于是备选只剩 1 次机会 ——
      * 主力长时间不可用的时候，每个请求都会被静默削掉重试能力。
      *
-     * <p>用 400 而不是 500 来把 A 的熔断器打开：500 是可转移错误，
-     * 一旦转移 B 也会跟着吃失败、跟着被熔断，就分不清"跳过"和"没得跳"了。
-     * （顺带暴露出一个真实边界：4xx 目前也会计入熔断窗口，见 docs/step-20。）
+     * <p>熔断器怎么被打开不是本用例要验的东西（那是 {@code UpstreamResilienceTest} 的事），
+     * 所以这里**直接把 A 打到 OPEN**，避免经过管线的转移逻辑 ——
+     * 否则一旦用可转移错误（5xx）去打开它，B 会在打开之前就先接管掉请求，
+     * 最后分不清"跳过"和"根本没得跳"。
      */
     @Test
     void providerWithOpenCircuitIsSkippedWithoutCallingIt() {
@@ -299,31 +303,31 @@ class ChatPipelineFailoverTest {
         props.getResilience().getRetry().setEnabled(false);
         buildPipeline();
 
+        // 直接把 A 的窗口打满（窗口=2，熔断阈值 50% → 2 次失败即 OPEN）
+        for (int i = 0; i < 2; i++) {
+            StepVerifier.create(resilience.protect(PROVIDER_A, Mono.error(serverError())))
+                    .expectError().verify();
+        }
+        assertEquals(io.github.resilience4j.circuitbreaker.CircuitBreaker.State.OPEN,
+                resilience.stateOf(PROVIDER_A), "前置条件：A 已经熔断");
+
         AtomicInteger callsA = new AtomicInteger();
         AtomicInteger callsB = new AtomicInteger();
         when(adapterA.chat(eq(MODEL), any())).thenAnswer(inv -> {
             callsA.incrementAndGet();
-            return Mono.error(badRequest());
+            return Mono.error(serverError());
         });
         when(adapterB.chat(eq(MODEL), any())).thenAnswer(inv -> {
             callsB.incrementAndGet();
             return Mono.just(answer("B 接管"));
         });
 
-        // 前两轮：A 报 400（不可转移，B 不会被碰），两次失败把 A 的滑动窗口填满
-        for (int i = 0; i < 2; i++) {
-            StepVerifier.create(pipeline.execute(KEY, request(), "trace-f6-" + i))
-                    .expectError().verify();
-        }
-        assertEquals(2, callsA.get());
-        assertEquals(0, callsB.get(), "400 不该触发转移");
-
-        // 第三轮：A 已熔断 → 直接走 B
-        StepVerifier.create(pipeline.execute(KEY, request(), "trace-f6-3"))
+        // A 已 OPEN → 候选链应当直接跳过它，一次都不调用
+        StepVerifier.create(pipeline.execute(KEY, request(), "trace-f6"))
                 .expectNextMatches(r -> "B 接管".equals(r.content()))
                 .verifyComplete();
 
-        assertEquals(2, callsA.get(), "熔断打开后不该再往 A 发请求 —— 哪怕一次");
+        assertEquals(0, callsA.get(), "熔断打开后不该再往 A 发请求 —— 哪怕一次");
         assertEquals(1, callsB.get());
     }
 

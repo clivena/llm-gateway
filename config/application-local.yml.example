@@ -2,6 +2,11 @@
 # 用法：cp application-local.yml.example application-local.yml 然后填入自己的 key
 
 gateway:
+  # 运维接口令牌。留空 = 只允许本机访问 /admin/**（本地开发够用）。
+  # 远程运维或部署到公网时必须填一个随机串，否则 /admin/ledger/* 会暴露给任何人。
+  # 建议：openssl rand -hex 24
+  admin:
+    token: ""
   cache:
     enabled: false          # 上游无 embedding 接口时缓存自动失效，这里显式关掉
   router:

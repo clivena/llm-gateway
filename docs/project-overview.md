@@ -4,11 +4,11 @@
 >
 > | 项    | 值                                                                              |
 > | ---- | ------------------------------------------------------------------------------ |
-> | 对应提交 | 2026-10-17（F3 任务路由 → step-22 复查 → R2 留证 → B 批 P7 链路归因）        |
-> | 生产代码 | 44 个 Java 类 · 5948 行（`src/main/java`）                                          |
-> | 测试代码 | 23 个测试类 · 202 passed / 0 failures / 0 errors                                   |
-> | 真机脚本 | 10 个 Python 脚本（`scripts/`）                                                     |
-> | 步骤文档 | 20 篇 step + 索引，共 4138 行（`docs/`）                                            |
+> | 对应提交 | 2026-10-17（F3 任务路由 → step-22 复查 → R2 留证 → P7 链路归因 → 运维鉴权）    |
+> | 生产代码 | 45 个 Java 类 · 6134 行（`src/main/java`）                                          |
+> | 测试代码 | 24 个测试类 · 210 passed / 0 failures / 0 errors                                   |
+> | 真机脚本 | 11 个 Python 脚本（`scripts/`）                                                     |
+> | 步骤文档 | 21 篇 step + 索引，共 4369 行（`docs/`）                                            |
 > | 中间件  | Redis(+Lua/RediSearch) · PostgreSQL(R2DBC) · Kafka · Resilience4j · Micrometer |
 >
 > 文中所有数字都可复现。复现方式见第 7 节。
@@ -329,13 +329,14 @@ return 0                        -- 放行并预扣
 
 | 项 | 结果 |
 |---|---|
-| 单测 | **202 passed / 0 failures / 0 errors**（`mvn -o clean test`） |
+| 单测 | **210 passed / 0 failures / 0 errors**（`mvn -o clean test`） |
 | 配额原子性 | 20 并发 / 上限 50 / 预扣 7 → 7 放行 13 拒绝，终值 49 |
 | 缓存命中 | 命中快 250~400 倍，`usage` 全 0/0，三重交叉验证 |
 | Token 估算 | 六组探针，估算/真实 = 1.00 / 1.00 / 1.03 / 1.02 / 1.00 / 1.01 |
 | 重试与熔断 | 11/11 PASS（P7 复跑），含"熔断后上游请求数 4→4 未变" |
 | 跨 provider 转移 | 13/13 PASS（P7 复跑），含"桩A 收到 3 次"证明重试在内、转移在外 |
 | 任务路由 | 15/15 PASS，含响应头、账本 `task` / `provider` 列、`/admin/route`、`/admin/ledger/by-provider` |
+| 运维鉴权 | 7/7 PASS（step-25），含**真实非环回来源**的 403 与带 token 的 200 |
 
 ### 6.2 已知边界（诚实清单）
 
@@ -364,7 +365,7 @@ cp config/application-local.yml.example config/application-local.yml
 # 填入自己的 key
 
 # 3) 全量单测
-mvn -o clean test                      # 期望 202 passed
+mvn -o clean test                      # 期望 210 passed
 
 # 4) 真机联调（自己起服务、跑断言、收指标、关服务）
 python scripts/run-gateway-smoke.py
@@ -380,6 +381,7 @@ python scripts/run-gateway-smoke.py
 | `check-resilience.py` | 重试 + 熔断 | 11 |
 | `check-failover.py` | 跨 provider 转移 | 13 |
 | `check-task-routing.py` | 按任务选模型 + 留证 + 链路归因 | 15 |
+| `check-admin-auth.py` | 运维接口鉴权（环回 / 外部 + token） | 7 |
 | `probe-upstream-shape.py` | 上游到底返回了什么 | — |
 
 ---

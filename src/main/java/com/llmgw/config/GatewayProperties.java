@@ -19,6 +19,7 @@ public class GatewayProperties {
     private List<Provider> providers = new ArrayList<>();
     /** 模型 -> 单价（元 / 1K tokens）。缺失时回退到 ModelTier.costPer1k 估算。 */
     private Map<String, Price> pricing = new LinkedHashMap<>();
+    private Admin admin = new Admin();
 
     public static class Cache {
         private boolean enabled = true;
@@ -428,6 +429,25 @@ public class GatewayProperties {
         public void setStreamIncludeUsage(boolean v) { this.streamIncludeUsage = v; }
     }
 
+    /**
+     * 运维接口（{@code /admin/**}）的访问控制。
+     *
+     * <p>为什么默认不是"配了才校验"：那样一旦忘配，{@code /admin/ledger/*} 就会
+     * 把全部租户的消费明细公开在公网上，而且<b>没有任何信号</b>。
+     * 这里的默认是"没配 token 只允许本机访问"——本地开发零配置可用，
+     * 一旦从外部访问就明确拒绝，不会静默暴露。
+     */
+    public static class Admin {
+        /**
+         * 非空时，所有 {@code /admin/**} 请求必须带 {@code X-Admin-Token} 且值相等。
+         * 为空时退化为"仅允许环回地址访问"。
+         */
+        private String token = "";
+
+        public String getToken() { return token; }
+        public void setToken(String token) { this.token = token; }
+    }
+
     public Cache getCache() { return cache; }
     public void setCache(Cache cache) { this.cache = cache; }
     public Quota getQuota() { return quota; }
@@ -444,4 +464,6 @@ public class GatewayProperties {
     public void setPricing(Map<String, Price> pricing) { this.pricing = pricing; }
     public List<Provider> getProviders() { return providers; }
     public void setProviders(List<Provider> providers) { this.providers = providers; }
+    public Admin getAdmin() { return admin; }
+    public void setAdmin(Admin admin) { this.admin = admin; }
 }

@@ -233,6 +233,20 @@ python scripts/run-gateway-smoke.py
 | GET | `/dashboard` | 可视化控制台（同源托管） |
 | GET | `/actuator/prometheus` | Prometheus 指标（含 `llmgw_cache_hit` 等自定义指标） |
 
+**`/admin/**` 的访问控制**（step-25）：
+
+- 未配置 `gateway.admin.token`：**只允许本机**（127.0.0.1 / ::1）访问，本地开发与 dashboard 零配置可用；
+- 已配置：所有 `/admin/**` 必须带 `X-Admin-Token`，值相同才放行；
+- 来自外部地址而未配 token → `403 admin_token_not_configured`；配了但没带/带错 → `401 unauthorized`。
+
+```bash
+# 远程运维（或部署到公网时）
+export ADMIN_TOKEN=$(openssl rand -hex 24)
+curl -s -H "X-Admin-Token: $ADMIN_TOKEN" http://<host>:8080/admin/ledger/recent?limit=5
+```
+
+> 业务接口 `/v1/**` **不受**这套鉴权影响 —— 它的维度是 `X-Api-Key` + 配额。
+
 两个**不属于 OpenAI 协议**的请求字段（本网关的私有扩展，普通 OpenAI 客户端忽略即可）：
 
 | 字段 | 作用 |
@@ -494,7 +508,7 @@ A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来�
 
 ### 任务路由验证（按 task 选模型）
 
-**单元测试**：`mvn -o clean test` → **202 passed**（F3 交付时 175 → step-22 +11 → step-23 +14 → P7 +2）。
+**单元测试**：`mvn -o clean test` → **210 passed**（F3 交付时 175 → step-22 +11 → step-23 +14 → P7 +2 → step-25 +8）。
 
 | 层面 | 断言 |
 |---|---|
@@ -535,6 +549,34 @@ G4 同理：它用**这次响应的 `traceId`** 去库里找那一行，
 **G6 不是 G4 的重复**：非流式在拿到响应体那一刻就知道是谁答的；
 流式根本拿不到"响应对象"，只能在开始拉流时记下 adapter 名。
 两条路径的实现完全不同，只验一条等于把另一半留在未验证状态。
+
+### 运维接口鉴权验证（step-25）
+
+**单元测试**：`mvn -o clean test` → **210 passed**（P7 的 202 → +8）。
+
+| 层面 | 断言 |
+|---|---|
+| 默认策略 | 未配 token：环回放行、外部 403、**来源未知也 403**（fail-closed，只能在 mock 里钉住） |
+| 配置后 | 环回也必须带 `X-Admin-Token`；错值 401；对值从任意地址放行 |
+| 边界 | `/v1/**` 不受影响；`/administrator` 不被误拦 |
+
+**真机**：`scripts/check-admin-auth.py` —— **7/7 PASS**。
+
+```
+✓ A1 未配 token 时本机可访问              HTTP=200
+✓ A2 未配 token 时外部被拒                来源=172.22.102.90 HTTP=403 admin_token_not_configured
+✓ B1 配 token 后本机不带凭证也被拒        HTTP=401 unauthorized
+✓ B2 错误的 token 被拒                    HTTP=401
+✓ B3 正确的 token 放行                    HTTP=200
+✓ B4 业务接口不受运维鉴权影响             HTTP=400（绝不该是 401/403）
+✓ B5 远程带对 token 可访问                来源=172.22.102.90 HTTP=200
+```
+
+A2 / B5 的"外部来源"是真的：脚本用 UDP connect 拿本机局域网地址，再用它访问自己，
+服务端看到的 `remoteAddress` 就不是环回。拿不到局域网地址时这两条标 `SKIP` 并在
+汇总里说明，不会假装通过。
+
+复跑：`docker compose up -d && python scripts/check-admin-auth.py`
 
 ### 复查修复（step-22）
 
@@ -739,6 +781,19 @@ G4 同理：它用**这次响应的 `traceId`** 去库里找那一行，
     用 `model` 反推回去更糟——F2 之后一个 model 可能对多家，反推值一半是错的，且错得看起来很合理。
 47. **`/admin/ledger/by-provider` 没有时间窗口参数**，是全量聚合。要"最近 7 天"得直接写 SQL。
 
+### 运维接口鉴权新增的边界（step-25）
+
+48. ~~**`/admin/*` 没有鉴权**~~ → **已做（step-25）**：没配 `gateway.admin.token` 时
+    **只允许环回地址**；配了就必须带 `X-Admin-Token`。默认收紧而不是"配了才校验" ——
+    后者的失败形态是"忘配 = 账本全裸且无信号"。
+49. **配了 token 之后 `/dashboard` 取不到数据**：面板前端是编译产物，fetch 不带自定义 header。
+    本地开发不配 token（环回放行）即可；远程部署要给面板加 token 输入框或走反代注入。
+50. **单 token，没有租户/角色/过期/审计**。它回答"能不能进运维面"，不回答"是谁进来的"。
+51. **`/actuator/prometheus` 未保护**：指标里没有 `apiKey`，但暴露业务量与错误率。
+    内网抓取可接受，上公网应在反代层限制来源。
+52. **反向代理后面必须配 token**：经过 nginx 之后 `remoteAddress` 是 nginx 的地址（非环回），
+    默认策略会直接拒绝。这是**正确行为**，但部署时必须知道。
+
 ---
 
 ## 踩过的坑（都是真实调试记录）
@@ -793,6 +848,7 @@ G4 同理：它用**这次响应的 `traceId`** 去库里找那一行，
 | [22](./docs/step-22-review-fixes-2.md) | **复查修复**：4xx 不再熔断 provider + 被丢弃的尝试也记账 + 流式收尾帧 + 计价档位 |
 | [23](./docs/step-23-r2-observability.md) | **R2 留证**：路由响应头（RouteTrace）+ 账本 `task` 列 + `/admin/route`；顺带修掉脚本"假绿" |
 | [24](./docs/step-24-provider-attribution.md) | **B 批 P7 链路归因**：账本 `provider` 列 + `/admin/ledger/by-provider`；流式与非流式分别取 provider |
+| [25](./docs/step-25-admin-auth.md) | **运维接口鉴权**：默认"没配 token 只许本机" + 常量时间比较 + 403/401 语义分离 |
 
 ---
 

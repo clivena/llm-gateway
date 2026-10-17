@@ -28,8 +28,9 @@
 | 22 | **复查修复**：4xx 不再熔断 provider + 被丢弃的尝试也记账 + 流式收尾帧 + 计价档位 | [step-22](./step-22-review-fixes-2.md) |
 | 23 | **R2 留证**：路由响应头 + 账本 `task` 列 + `/admin/route`；顺带修掉脚本"假绿" | [step-23](./step-23-r2-observability.md) |
 | 24 | **B 批 P7 链路归因**：账本 `provider` 列 + Kafka 事件 + `/admin/ledger/by-provider`；流式与非流式分别取 provider | [step-24](./step-24-provider-attribution.md) |
+| 25 | **运维接口鉴权**：默认"没配 token 只许本机" + 常量时间比较 + 403/401 语义分离 | [step-25](./step-25-admin-auth.md) |
 
-> 16~24 均已成篇。14 号步骤当时未单独成篇，内容并入 [step-15](./step-15-review-fixes.md)。
+> 16~25 均已成篇。14 号步骤当时未单独成篇，内容并入 [step-15](./step-15-review-fixes.md)。
 > 当前状态与已知边界见 [README 的已知边界](../README.md#已知边界诚实清单)。
 
 ---

@@ -17,6 +17,20 @@ gateway:
         tier: STRONG
         cost-per-1k: 0.0080
         quality-score: 0.90
+
+    # 按任务选模型（默认关闭）。开启后 model=auto 的请求会先判任务再查这张表；
+    # 请求里显式指定的 model 仍然最优先，不受这里影响。
+    # 启动期校验：tasks 不能为空、每个 model 必须在上面 candidates 里、
+    #             default-task 必须在这里声明、classifier 只能是 rule / off。
+    task-routing:
+      enabled: true
+      default-task: chat
+      classifier: rule       # rule = 本地规则推断；off = 只认请求里的显式 task
+      tasks:
+        code:      { model: deepseek-v4-pro }   # 写代码/读代码/改 bug → 强模型
+        json:      { model: deepseek-flash }
+        summarize: { model: deepseek-flash }
+        chat:      { model: deepseek-flash }
   providers:
     # name 是**供应商标识**（用于日志与成本归因），不是协议标识 ——
     # 所有 provider 目前都走 OpenAI 兼容协议，所以写真实厂商名即可。

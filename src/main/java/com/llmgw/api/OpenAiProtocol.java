@@ -38,6 +38,26 @@ public final class OpenAiProtocol {
     /** 缓存命中标记。放响应头而不是 body，见规则 A。 */
     public static final String CACHE_HIT_HEADER = "X-Cache-Hit";
 
+    /**
+     * 本次请求被判定成哪个任务（网关私有诊断信息，同样只能走响应头）。
+     *
+     * <p>为什么客户端需要它：同一个 {@code model=auto} 请求，网关可能按任务选了
+     * 完全不同的模型。没有这个头，调用方只能从答案质量猜自己走的是哪一档 ——
+     * 而当"任务判错了"时，表现是"答案突然变差"，不是报错。
+     *
+     * <p>值可能是 {@code explicit}（客户端点名了模型、未参与任务判定）
+     * 或 {@code n/a}（任务路由关闭）。
+     */
+    public static final String ROUTE_TASK_HEADER = "X-Route-Task";
+
+    /**
+     * 任务判定的来源：{@code explicit} / {@code inferred} / {@code fallback}。
+     *
+     * <p>必须与任务名成对出现：同为 {@code code}，"客户端明说的"与"网关猜的"
+     * 是两件事 —— 前者的修法是改调用方，后者是改判定规则。
+     */
+    public static final String ROUTE_SOURCE_HEADER = "X-Route-Source";
+
     /** SSE 流的终止帧标记（它本身不是 JSON，是一段字面量）。 */
     public static final String DONE = "[DONE]";
 

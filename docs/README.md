@@ -26,8 +26,9 @@
 | 20 | **跨 provider 故障转移**：候选链 + 请求级预算 + 流式闸门跨 provider 共享（F2） | [step-20](./step-20-cross-provider-failover.md) |
 | 21 | **按任务选模型**：三层判定 + 规则分类器 + 任务映射表 + 开关只能有一个 | [step-21](./step-21-task-based-routing.md) |
 | 22 | **复查修复**：4xx 不再熔断 provider + 被丢弃的尝试也记账 + 流式收尾帧 + 计价档位 | [step-22](./step-22-review-fixes-2.md) |
+| 23 | **R2 留证**：路由响应头 + 账本 `task` 列 + `/admin/route`；顺带修掉脚本"假绿" | [step-23](./step-23-r2-observability.md) |
 
-> 16~22 均已成篇。14 号步骤当时未单独成篇，内容并入 [step-15](./step-15-review-fixes.md)。
+> 16~23 均已成篇。14 号步骤当时未单独成篇，内容并入 [step-15](./step-15-review-fixes.md)。
 > 当前状态与已知边界见 [README 的已知边界](../README.md#已知边界诚实清单)。
 
 ---
@@ -56,6 +57,8 @@
 | [step-19](./step-19-retry-and-circuit-breaker.md) | 空正文的重试耗尽后，在 `callUpstream` 内部还原成原始响应 | **位置已挪走**：还原必须在整条候选链的**末端**（`terminal`）。在单次调用内部还原等于把空正文变成一个成功值，外层再没机会问下一家——F2 的 `emptyAnswerTriggersFailover` 第一次跑就是这样红的（见 [step-20](./step-20-cross-provider-failover.md)） |
 | [step-19](./step-19-retry-and-circuit-breaker.md) / [step-20](./step-20-cross-provider-failover.md) | 重试的中间尝试不落账，"每次尝试单独落账"列为待办 | **已修**：被重试/转移丢弃的尝试各自落账并计入配额，判据是"下一次尝试开始"（见 [step-22](./step-22-review-fixes-2.md)）。流式仍不补——拿不到 usage |
 | [step-20](./step-20-cross-provider-failover.md) | 4xx 会计入熔断窗口，应配 `ignoreException(...)` | **已修**：4xx（429 除外）既不算成功也不算失败。否则一个坏客户端连发参数错误就能把健康 provider 熔断，所有租户一起 503 |
+| [step-21](./step-21-task-based-routing.md) | 响应头 `X-Route-Task` / `X-Route-Source` 打算"用 exchange attribute 做" | **改了方案**：`core` 层不能依赖 `ServerWebExchange`（否则换接入协议就要重写判断逻辑）。实际用一个极小的 `RouteTrace` 回执传递（见 [step-23](./step-23-r2-observability.md)） |
+| [step-21](./step-21-task-based-routing.md) | "账本没有 `task` 列"是已知边界 | **已做**：加列 + 幂等迁移脚本。注意 `schema.sql` 只在空库执行，已有环境必须手动应用 `db/migrations/001-cost-ledger-task.sql` |
 
 ---
 

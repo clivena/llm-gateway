@@ -12,13 +12,20 @@
   6. 显式 model + task     → 以 model 为准（不因任务替换用户点名的模型）
   7. 流式                  → 分片里的 model 就是路由结果
   8. 指标                  → llmgw_route_task_total 带 task / source 标签
+  9. 响应头                → X-Route-Task / X-Route-Source（非流式 + 流式）
+ 10. 账本                  → cost_ledger.task 真的按请求写进去（不是恒 NULL）
+ 11. 运维端点              → /admin/route 同时给出映射表与命中分布
 
 第 5 条尤其重要：实现里路由是**同步**解析的，若异常没有转成 Mono.error /
 Flux.error，它就不会进控制器的 onErrorResume，客户端会收到 500 而不是 400 ——
 单测里如果只断言异常类型，这个差别完全看不出来。
 
-前置依赖：Redis（配额走 Redis + Lua，没有开关）。
+第 10 条同样只有真机能验：列加了、SQL 改了，但绑参漏了或绑成空串，
+单测里看到的只是"调用了一个方法"，只有数据库里的那一行能证明它真的写对了。
+
+前置依赖：Redis（配额走 Redis + Lua，没有开关）+ Postgres（G4 要读账本）。
   docker compose up -d
+  已有库需要先应用迁移：db/migrations/001-cost-ledger-task.sql
 
 用法：
   python scripts/check-task-routing.py
@@ -268,7 +275,13 @@ def stop_app(proc):
 
 
 # ============================================================ 请求
-def ask(text, task=None, model="auto", stream=False, timeout=120):
+def _request(text, task=None, model="auto", stream=False, timeout=120):
+    """发一次请求，把状态码、正文和**响应头**都带回来。
+
+    响应头必须单独取：X-Route-* 只存在于头里（body 保持纯 OpenAI 形状），
+    而 "头有没有设" 和 "body 里的 model 对不对" 是两件独立的事 ——
+    前者断言的是诊断信息，后者断言的是实际选中的模型。
+    """
     body = {"model": model, "messages": [{"role": "user", "content": text}]}
     if task is not None:
         body["task"] = task
@@ -282,9 +295,35 @@ def ask(text, task=None, model="auto", stream=False, timeout=120):
     )
     try:
         with NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
-            return resp.status, resp.read().decode("utf-8", errors="replace")
+            return resp.status, resp.read().decode("utf-8", errors="replace"), dict(resp.headers)
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", errors="replace")
+        return e.code, e.read().decode("utf-8", errors="replace"), dict(e.headers)
+
+
+def ask(text, task=None, model="auto", stream=False, timeout=120):
+    status, body, _ = _request(text, task=task, model=model, stream=stream, timeout=timeout)
+    return status, body
+
+
+def ask_headers(text, task=None, model="auto", stream=False, timeout=120):
+    return _request(text, task=task, model=model, stream=stream, timeout=timeout)
+
+
+def get_json(path, timeout=20):
+    with NO_PROXY_OPENER.open(BASE + path, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def hget(headers, name):
+    """大小写不敏感地取响应头。
+
+    直接把 headers 转成 dict 会丢掉 email.message 的大小写不敏感语义，
+    而"头名大小写"不该成为一条断言的失败原因 —— 那是 HTTP 规范保证的事。
+    """
+    for k, v in headers.items():
+        if k.lower() == name.lower():
+            return v
+    return None
 
 
 def record(name, ok, detail):
@@ -400,6 +439,81 @@ def run_cases():
                "task=code:%s source=explicit:%s" % (has_code, has_explicit))
     except Exception as e:
         record("F1 llmgw.route.task 指标可用", False, "读取失败：%r" % (e,))
+
+    log()
+    log("=" * 72)
+    log("G 段 · 诊断能力：判定结果与成本归因能不能被外部看到")
+    log("=" * 72)
+
+    # G1 / G2：响应头。这两条的失败形态是"请求全对、只是头没设"，
+    # 单测能覆盖接线，但覆盖不了"Spring 有没有把它写出去"。
+    status, _, headers = ask_headers("总结一下这段话", task="summarize")
+    task_h = hget(headers, "X-Route-Task")
+    source_h = hget(headers, "X-Route-Source")
+    record("G1 非流式响应头带 X-Route-Task / X-Route-Source",
+           status == 200 and task_h == "summarize" and source_h == "explicit",
+           "HTTP=%s task=%s source=%s" % (status, task_h, source_h))
+
+    status, _, headers = ask_headers("看看这段：\n```java\nint a = 1;\n```")
+    task_h = hget(headers, "X-Route-Task")
+    source_h = hget(headers, "X-Route-Source")
+    record("G2 推断来源可区分（inferred 而不是 explicit）",
+           status == 200 and task_h == "code" and source_h == "inferred",
+           "HTTP=%s task=%s source=%s" % (status, task_h, source_h))
+
+    status, _, headers = ask_headers("```java\nint a = 1;\n```", task="code", stream=True)
+    task_h = hget(headers, "X-Route-Task")
+    record("G3 流式响应头同样带路由结果",
+           status == 200 and task_h == "code",
+           "HTTP=%s task=%s" % (status, task_h))
+
+    # G4：账本 task 列。用**这次响应的 traceId** 去库里找那一行 ——
+    # 这比"看最新一行"强得多：它同时证明了响应与账本属于同一次请求，
+    # 以及 task 是跟着这次判定走的，而不是碰巧被上一条请求写进去的。
+    # （第一次实现用 id 递增做判据，而 /admin/ledger/recent 当时不返回 id，
+    #  于是判据恒假、断言恒失败 —— 一个"看起来在验、其实什么都没验"的教训。）
+    try:
+        status, _, headers = ask_headers("帮我重构一下这段逻辑", task="code")
+        trace_id = hget(headers, "X-Trace-Id")
+
+        row = None
+        deadline = time.time() + 10
+        while time.time() < deadline and trace_id:
+            rows = [r for r in get_json("/admin/ledger/recent?limit=50")
+                    if r.get("trace_id") == trace_id]
+            if rows:
+                row = rows[0]
+                break
+            time.sleep(0.4)
+
+        record("G4 账本按请求写入 task 列",
+               status == 200 and row is not None
+               and row.get("task") == "code" and row.get("model") == PRO,
+               "trace=%s 行=%s" % (trace_id,
+                                   {k: row.get(k) for k in ("task", "model")} if row else None))
+    except Exception as e:
+        record("G4 账本按请求写入 task 列", False,
+               "读取失败：%r（/admin/ledger/recent 依赖 Postgres）" % (e,))
+
+    # G5：/admin/route。它必须同时给出"配置生效成什么样"和"实际命中分布"，
+    # 只回显配置是不够的 —— 排障要回答的是"现在到底在往哪边倒"。
+    try:
+        route = get_json("/admin/route")
+        tasks = route.get("tasks") or {}
+        hits = route.get("hits") or {}
+        record("G5 /admin/route 给出映射表与命中分布",
+               route.get("enabled") is True
+               and (tasks.get("code") or {}).get("model") == PRO
+               and (tasks.get("chat") or {}).get("model") == FLASH
+               and (hits.get("code") or {}).get("explicit", 0) >= 1
+               and route.get("hitsScope") == "since-process-start",
+               "enabled=%s code→%s chat→%s hits.code=%s"
+               % (route.get("enabled"),
+                  (tasks.get("code") or {}).get("model"),
+                  (tasks.get("chat") or {}).get("model"),
+                  hits.get("code")))
+    except Exception as e:
+        record("G5 /admin/route 给出映射表与命中分布", False, "读取失败：%r" % (e,))
 
 
 def main():

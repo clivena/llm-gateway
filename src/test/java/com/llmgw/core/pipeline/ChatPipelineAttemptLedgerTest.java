@@ -131,8 +131,10 @@ class ChatPipelineAttemptLedgerTest {
         assertEquals(2, calls.get(), "首次空正文 + 重试一次");
 
         // ① 账本：两次真实上游调用 → 两行
+        // 顺带钉住账本的 task 列：路由判定成 chat，两行都必须带这个值 ——
+        // 只记 model 的话，多个任务映射到同一模型时就再也分不出成本归因。
         verify(ledger, timeout(2000).times(2)).record(
-                eq("trace-1"), eq(KEY), any(), eq(MODEL), eq(false),
+                eq("trace-1"), eq(KEY), any(), eq("chat"), eq(MODEL), eq(false),
                 anyInt(), anyInt(), anyDouble(), anyLong());
 
         // ② 配额：结算的是两次用量之和，不是最终那一次
@@ -158,7 +160,7 @@ class ChatPipelineAttemptLedgerTest {
                 .verifyComplete();
 
         verify(ledger, timeout(2000).times(1)).record(
-                eq("trace-2"), eq(KEY), any(), eq(MODEL), eq(false),
+                eq("trace-2"), eq(KEY), any(), eq("chat"), eq(MODEL), eq(false),
                 eq(34), eq(20), anyDouble(), anyLong());
 
         ArgumentCaptor<Long> actual = ArgumentCaptor.forClass(Long.class);
@@ -184,7 +186,7 @@ class ChatPipelineAttemptLedgerTest {
 
         // 2 次尝试：前 1 次被重试丢弃 → 1 行；最后 1 次作为最终响应 → 1 行
         verify(ledger, timeout(2000).times(2)).record(
-                eq("trace-3"), eq(KEY), any(), eq(MODEL), eq(false),
+                eq("trace-3"), eq(KEY), any(), eq("chat"), eq(MODEL), eq(false),
                 eq(34), eq(800), anyDouble(), anyLong());
     }
 }

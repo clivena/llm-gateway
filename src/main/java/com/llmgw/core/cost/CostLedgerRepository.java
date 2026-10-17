@@ -29,29 +29,38 @@ public class CostLedgerRepository {
 
     private static final String INSERT_SQL = """
             INSERT INTO cost_ledger
-              (trace_id, api_key, feature, model, cache_hit,
+              (trace_id, api_key, feature, task, model, cache_hit,
                prompt_tokens, completion_tokens, cost, latency_ms)
             VALUES
-              (:traceId, :apiKey, :feature, :model, :cacheHit,
+              (:traceId, :apiKey, :feature, :task, :model, :cacheHit,
                :promptTokens, :completionTokens, :cost, :latencyMs)
             """;
 
-    public Mono<Long> insert(String traceId, String apiKey, String feature, String model,
+    /**
+     * @param task 本次请求被判定成的任务（{@link com.llmgw.core.router.Route#task()}）。
+     *             任务路由关闭时为 null —— 那表示"没有发生任务判定"，
+     *             与"判定成 chat"是两件不同的事实，不能都用字符串占位符表示，
+     *             否则按 task 分组统计时会出现一个假的 {@code n/a} 桶。
+     */
+    public Mono<Long> insert(String traceId, String apiKey, String feature, String task, String model,
                              boolean cacheHit, int promptTokens, int completionTokens,
                              double cost, long latencyMs) {
-        return db.sql(INSERT_SQL)
+        DatabaseClient.GenericExecuteSpec spec = db.sql(INSERT_SQL)
                 .bind("traceId", traceId)
                 .bind("apiKey", apiKey)
-                // feature 允许为空 -> 必须显式绑 null，否则 SQL 里的 :feature 无法解析
+                // feature 历史上就是"空串代表没有"，保持不变（改它等于改既有账本语义）
                 .bind("feature", feature == null ? "" : feature)
                 .bind("model", model)
                 .bind("cacheHit", cacheHit)
                 .bind("promptTokens", promptTokens)
                 .bind("completionTokens", completionTokens)
                 .bind("cost", BigDecimal.valueOf(cost))
-                .bind("latencyMs", (int) latencyMs)
-                .fetch()
-                .rowsUpdated();
+                .bind("latencyMs", (int) latencyMs);
+        // task 绑真正的 NULL 而不是空串：按任务分组统计时，空串会变成
+        // 一个"叫空字符串的任务"的桶，而 NULL 才能被 GROUP BY 正确归组，
+        // 也才能和"判定成 chat"区分开。
+        spec = task == null ? spec.bindNull("task", String.class) : spec.bind("task", task);
+        return spec.fetch().rowsUpdated();
     }
 
     /** 对账用：按租户汇总。 */
@@ -69,10 +78,34 @@ public class CostLedgerRepository {
                 .fetch().all();
     }
 
+    /**
+     * 按任务维度对账：每个任务花了多少。
+     *
+     * <p>这是 {@code task} 列真正的用处。没有它，只能从 {@code model} 反推
+     * "当时大概走了什么任务" —— 而当多个任务映射到同一个模型时，
+     * 反推直接失效，成本归因就没法回答"该砍哪个任务的预算"。
+     *
+     * <p>NULL 用 {@code (none)} 呈现：那表示任务路由关闭期间产生的账，
+     * 与"判定成某个叫 none 的任务"是两件事（见 insert 的注释）。
+     */
+    public Flux<Map<String, Object>> summaryByTask() {
+        return db.sql("""
+                        SELECT COALESCE(task, '(none)') AS task,
+                               count(*)                AS calls,
+                               sum(prompt_tokens)      AS prompt_tokens,
+                               sum(completion_tokens)  AS completion_tokens,
+                               round(sum(cost), 6)     AS total_cost
+                        FROM cost_ledger
+                        GROUP BY COALESCE(task, '(none)')
+                        ORDER BY total_cost DESC
+                        """)
+                .fetch().all();
+    }
+
     /** 明细，按时间倒序。 */
     public Flux<Map<String, Object>> recent(int limit) {
         return db.sql("""
-                        SELECT trace_id, api_key, feature, model, cache_hit,
+                        SELECT trace_id, api_key, feature, task, model, cache_hit,
                                prompt_tokens, completion_tokens, cost, latency_ms, created_at
                         FROM cost_ledger
                         ORDER BY id DESC

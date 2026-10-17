@@ -1119,6 +1119,13 @@ def phase(results, name, providers, resilience=None, body=None):
         if not wait_ready(tail):
             log("  [!] 服务未就绪，本段中止")
             dump_tail(tail)
+            # ★ 必须留下一条 FAIL 记录。
+            # 否则这一段的断言会**静默消失**，而汇总只看"已记录的结果是不是全绿" ——
+            # 于是"什么都没跑"会被读成"全部通过"。这不是假设：
+            # 2026-10-17 有一次脚本正好在源码改到一半时启动，编译失败，
+            # B/C 两段（共 10 条断言）全部没跑，汇总却打印了"F2 验证全部通过 ✅"。
+            results.append((name + " · 服务未启动", False,
+                            "编译或启动失败：本段断言一条都没执行"))
             return None
         return body(proc, tail)
     finally:
@@ -1142,16 +1149,16 @@ def main():
             log()
             log("  [中止] 依赖容器未运行: %s" % ", ".join(missing))
             log("         先跑：docker compose up -d redis postgres")
-            return
+            return 2
         log("  依赖容器 redis / postgres 均在运行 ✓")
 
         if tcp_ok():
             log("  [!] 端口 %d 已被占用，先停掉占用进程再跑" % PORT)
-            return
+            return 2
         for p in (STUB_A_PORT, STUB_B_PORT):
             if tcp_ok(p):
                 log("  [!] 桩端口 %d 已被占用，先释放（或设 F2_STUB_A_PORT/F2_STUB_B_PORT）" % p)
-                return
+                return 2
 
         # ---------- A 段 ----------
         ctx = None
@@ -1169,6 +1176,9 @@ def main():
                 phase(results, "A2（真实上游 + 链首坏候选）",
                       providers=[dead_provider(), real],
                       body=lambda proc, tail: run_real_failover(results, ctx))
+            else:
+                results.append(("A2 链首不可达透明转移", False,
+                                "A1 未产出真实上游上下文，本段未执行"))
 
         # ---------- 起两个桩 ----------
         log()
@@ -1210,6 +1220,15 @@ def main():
         for name, good, detail in results:
             log("  [%s] %-30s %s" % ("PASS" if good else "FAIL", name, detail))
             ok = ok and good
+
+        # 断言条数下限：这是"没有静默跳过"的最后一道闸门。
+        # 全绿但只跑了 3 条，说明有两段根本没启动 —— 那种结果比红色更危险，
+        # 因为它会被人当成"已验证"写进文档。
+        expected = 10 if (SKIP_REAL or not real) else 13
+        if len(results) < expected:
+            log()
+            log("  [!] 只记录了 %d/%d 条断言 —— 有分段没执行，不能算通过" % (len(results), expected))
+            ok = False
     finally:
         for s in (stub_a, stub_b):
             if s:
@@ -1225,5 +1244,9 @@ def main():
         log("=== 结果: %s ===" % ("F2 验证全部通过 ✅" if ok else "未通过 ❌（见上方 FAIL 项）"))
         flush()
 
+    # 退出码必须反映结果，理由同 check-resilience.py：
+    # 没有返回值的 main() 会让脚本在全红时也返回 0，放进 CI 就是"永远成功"。
+    return 0 if ok else 1
 
-main()
+
+raise SystemExit(main())

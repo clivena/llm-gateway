@@ -46,7 +46,16 @@ public class CostLedgerService {
         this.metrics = metrics;
     }
 
-    public void record(String traceId, String apiKey, String feature, String model,
+    /**
+     * 落一条账。
+     *
+     * @param feature 业务线（调用方自己标的，如 "resume-builder"）
+     * @param task    网关判定的任务（code / json / summarize / chat…）。
+     *                与 feature <b>语义正交</b>：feature 回答"哪个业务在花钱"，
+     *                task 回答"这笔钱是按什么能力需求花出去的"。
+     *                两者都为空是合法的（老客户端不传 feature、任务路由关闭）。
+     */
+    public void record(String traceId, String apiKey, String feature, String task, String model,
                        boolean cacheHit, int promptTokens, int completionTokens,
                        double cost, long latencyMs) {
 
@@ -58,7 +67,7 @@ public class CostLedgerService {
         final String feat = feature == null ? "" : feature;
 
         if (properties.getCost().toPostgres()) {
-            repository.insert(tid, apiKey, feat, model, cacheHit,
+            repository.insert(tid, apiKey, feat, task, model, cacheHit,
                             promptTokens, completionTokens, cost, latencyMs)
                     .subscribe(
                             rows -> metrics.onLedgerWrite(),
@@ -73,6 +82,7 @@ public class CostLedgerService {
             event.put("traceId", tid);
             event.put("apiKey", apiKey);
             event.put("feature", feat);
+            event.put("task", task);
             event.put("model", model);
             event.put("cacheHit", cacheHit);
             event.put("promptTokens", promptTokens);

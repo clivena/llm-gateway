@@ -889,15 +889,15 @@ def main():
             log()
             log("  [中止] 依赖容器未运行: %s" % ", ".join(missing))
             log("         先跑：docker compose up -d redis postgres")
-            return
+            return 2
         log("  依赖容器 redis / postgres 均在运行 ✓")
 
         if tcp_ok():
             log("  [!] 端口 %d 已被占用，先停掉占用进程再跑" % PORT)
-            return
+            return 2
         if tcp_ok(STUB_PORT):
             log("  [!] 桩端口 %d 已被占用，先释放（或设 F1_STUB_PORT）" % STUB_PORT)
-            return
+            return 2
 
         # ---------- A 段 ----------
         if SKIP_REAL:
@@ -910,7 +910,11 @@ def main():
             if not wait_ready(tail):
                 log("  [!] 服务未就绪，中止")
                 dump_tail(tail)
-                return
+                # 留下 FAIL 记录：否则 A 段 3 条断言会静默消失，
+                # 而"已记录的结果全绿"会被读成"全部通过"。
+                results.append(("A 段 · 服务未启动（真实上游）", False,
+                                "编译或启动失败，本段断言未执行"))
+                return 1
             run_real_upstream(results)
             log()
             log("Step 2 · 关闭服务（准备切到桩）")
@@ -935,7 +939,9 @@ def main():
         if not wait_ready(tail):
             log("  [!] 服务未就绪，中止")
             dump_tail(tail)
-            return
+            results.append(("B 段 · 服务未启动（桩上游）", False,
+                            "编译或启动失败，本段断言未执行"))
+            return 1
         run_stub_upstream(results)
 
         # ---------- 汇总 ----------
@@ -949,6 +955,16 @@ def main():
             ok = ok and good
         if not ok:
             dump_tail(tail)
+
+        # 断言条数下限：防止"某一段没启动 → 它的断言静默消失 → 汇总全绿"。
+        # 2026-10-17 在 check-failover.py 上真实发生过一次（源码改到一半时启动、
+        # 编译失败，两段共 10 条断言没跑，汇总却打印"全部通过"）。
+        expected = 8 if SKIP_REAL else 11
+        if len(results) < expected:
+            log()
+            log("  [!] 只记录了 %d/%d 条断言 —— 有分段没执行，不能算通过"
+                % (len(results), expected))
+            ok = False
     finally:
         if proc and proc.poll() is None:
             log()
@@ -968,5 +984,9 @@ def main():
         log("=== 结果: %s ===" % ("F1 验证全部通过 ✅" if ok else "未通过 ❌（见上方 FAIL 项）"))
         flush()
 
+    # 退出码必须反映结果：此前 main() 没有返回值，脚本即使全红也返回 0，
+    # 放进 CI 就是"永远成功"。这类错误的代价是把红色结论当绿色用。
+    return 0 if ok else 1
 
-main()
+
+raise SystemExit(main())

@@ -8,6 +8,8 @@ import io.micrometer.core.instrument.Timer;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Supplier;
@@ -215,6 +217,33 @@ public class GatewayMetrics {
                         .tag("source", source)
                         .register(registry))
                 .increment();
+    }
+
+    /**
+     * 本进程启动以来的路由命中快照：{@code task → source → 次数}。
+     *
+     * <p>为什么不用 Prometheus 查：{@code /admin/route} 的读者是在排障的人，
+     * 他问的是"现在这张表配上这几条规则，实际在往哪边倒"。
+     * 让他去拼 PromQL 才能回答自己刚打开的面板上的问题，是设计错误。
+     *
+     * <p>口径必须写清楚：<b>进程启动以来</b>，不是全量历史（重启即归零）。
+     * 需要跨重启的趋势就看 Prometheus —— 两者的用途不同，不要合成一个数。
+     *
+     * <p>返回 TreeMap：面板上的任务顺序稳定，不然每次刷新都在跳。
+     */
+    public Map<String, Map<String, Long>> routeCountsByTask() {
+        Map<String, Map<String, Long>> out = new TreeMap<>();
+        routeByTask.forEach((key, counter) -> {
+            int sep = key.indexOf('\u0000');
+            if (sep < 0) {
+                return;
+            }
+            String task = key.substring(0, sep);
+            String source = key.substring(sep + 1);
+            out.computeIfAbsent(task, t -> new TreeMap<>())
+                    .merge(source, (long) counter.count(), Long::sum);
+        });
+        return out;
     }
 
     /**

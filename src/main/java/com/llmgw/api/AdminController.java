@@ -4,6 +4,9 @@ import com.llmgw.config.GatewayProperties;
 import com.llmgw.core.cost.CostLedgerRepository;
 import com.llmgw.core.quota.QuotaService;
 import com.llmgw.core.resilience.UpstreamResilience;
+import com.llmgw.core.router.ModelTier;
+import com.llmgw.core.router.RouterService;
+import com.llmgw.observability.GatewayMetrics;
 import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -33,15 +36,20 @@ public class AdminController {
     private final GatewayProperties properties;
     private final DatabaseClient db;
     private final UpstreamResilience resilience;
+    private final RouterService router;
+    private final GatewayMetrics metrics;
 
     public AdminController(CostLedgerRepository ledger, QuotaService quota,
                            GatewayProperties properties, DatabaseClient db,
-                           UpstreamResilience resilience) {
+                           UpstreamResilience resilience, RouterService router,
+                           GatewayMetrics metrics) {
         this.ledger = ledger;
         this.quota = quota;
         this.properties = properties;
         this.db = db;
         this.resilience = resilience;
+        this.router = router;
+        this.metrics = metrics;
     }
 
     /** 账本明细，按 id 倒序。limit 收口在 1~200，避免被当成"全表导出"接口用。 */
@@ -54,6 +62,65 @@ public class AdminController {
     @GetMapping("/ledger/summary")
     public Flux<Map<String, Object>> summary() {
         return ledger.summaryByApiKey();
+    }
+
+    /**
+     * 账本按任务汇总：哪个任务在花钱、花了多少。
+     *
+     * <p>它是 {@code task} 列真正被用到的地方。只有明细里有这一列是不够的 ——
+     * 排障时的问题是"code 任务这周的成本是不是涨了"，那需要一个聚合视图，
+     * 而不是让人把明细导出去自己按列求和。
+     */
+    @GetMapping("/ledger/by-task")
+    public Flux<Map<String, Object>> byTask() {
+        return ledger.summaryByTask();
+    }
+
+    /**
+     * 当前生效的任务路由：映射表 + 本进程的命中分布。
+     *
+     * <p>这个端点的存在理由与 {@code /admin/circuit} 相同：排障时人问的是
+     * <b>带上下文</b>的问题 —— "code 现在配到哪个模型"、"最近这些请求是走
+     * 显式声明的还是网关猜的"。配置文件和日志各能回答一半，合起来才是完整答案，
+     * 而让人自己去 grep 日志就是在惩罚排障的人。
+     *
+     * <p>三个字段必须一起看：
+     * <ul>
+     *   <li>{@code tasks} 是从配置反查候选表得到的<b>真实档位</b>（含 qualityScore），
+     *       与运行时用的完全是同一份 —— 它不是把配置原样回显。</li>
+     *   <li>{@code hits} 是<b>进程启动以来</b>的计数，重启归零；跨重启看 Prometheus。</li>
+     *   <li>{@code source} 的分布能回答"规则是不是太激进"：推断占比高且集中在
+     *       某一个任务，通常说明那条规则命中面过宽。</li>
+     * </ul>
+     *
+     * <p>只读，不触发任何上游调用，也不改写任何状态。
+     */
+    @GetMapping("/route")
+    public Mono<Map<String, Object>> route() {
+        GatewayProperties.TaskRouting tc = properties.getRouter().getTaskRouting();
+
+        Map<String, Object> tasks = new LinkedHashMap<>();
+        for (Map.Entry<String, ModelTier> e : router.taskTable().entrySet()) {
+            ModelTier tier = e.getValue();
+            Map<String, Object> one = new LinkedHashMap<>();
+            one.put("model", tier.model());
+            one.put("tier", tier.tier());
+            one.put("costPer1k", tier.costPer1k());
+            one.put("qualityScore", tier.qualityScore());
+            tasks.put(e.getKey(), one);
+        }
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("enabled", tc.isEnabled());
+        out.put("defaultTask", tc.getDefaultTask());
+        out.put("classifier", tc.getClassifier());
+        out.put("policy", properties.getRouter().getPolicy());
+        out.put("tasks", tasks);
+        out.put("hits", metrics.routeCountsByTask());
+        // 口径写在响应里，而不是只写在文档里：拿到这份数据的人未必读过 README，
+        // 而"这个数是累计还是当前"直接决定他会不会用错。
+        out.put("hitsScope", "since-process-start");
+        return Mono.just(out);
     }
 
     /** 指定租户当前周期的配额使用情况。 */
@@ -132,6 +199,7 @@ public class AdminController {
             out.put("redis", t.getT1());
             out.put("postgres", t.getT2());
             out.put("routerPolicy", properties.getRouter().getPolicy());
+            out.put("taskRoutingEnabled", properties.getRouter().getTaskRouting().isEnabled());
             out.put("cacheEnabled", properties.getCache().isEnabled());
             out.put("cacheExactEnabled", properties.getCache().isExactEnabled());
             out.put("cacheSemanticEnabled", properties.getCache().isSemanticEnabled());

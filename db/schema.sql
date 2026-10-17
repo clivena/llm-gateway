@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS cost_ledger (
   trace_id          VARCHAR(64)  NOT NULL,
   api_key           VARCHAR(64)  NOT NULL,
   feature           VARCHAR(64),
+  -- 网关判定的任务（code / json / summarize / chat…）。与 feature 语义正交：
+  -- feature 是业务线，task 是能力需求。任务路由关闭时为 NULL
+  -- （NULL 表示"没有发生任务判定"，不是"判定成空字符串"）。
+  task              VARCHAR(32),
   model             VARCHAR(64)  NOT NULL,
   cache_hit         BOOLEAN      NOT NULL DEFAULT false,
   prompt_tokens     INT          NOT NULL DEFAULT 0,
@@ -38,6 +42,8 @@ CREATE TABLE IF NOT EXISTS cost_ledger (
   created_at        TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_cost_ledger_key_time ON cost_ledger (api_key, created_at);
+-- 按任务对账走这个索引（/admin/ledger/by-task）。
+CREATE INDEX IF NOT EXISTS idx_cost_ledger_task_time ON cost_ledger (task, created_at);
 
 CREATE TABLE IF NOT EXISTS model_route (
   task_type      VARCHAR(32) NOT NULL,

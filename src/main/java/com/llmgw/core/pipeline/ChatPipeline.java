@@ -17,6 +17,7 @@ import com.llmgw.core.resilience.UpstreamEmptyResponseException;
 import com.llmgw.core.resilience.UpstreamResilience;
 import com.llmgw.core.router.ModelTier;
 import com.llmgw.core.router.Route;
+import com.llmgw.core.router.RouteTrace;
 import com.llmgw.core.router.RouterService;
 import com.llmgw.core.token.TokenEstimator;
 import com.llmgw.observability.GatewayMetrics;
@@ -101,7 +102,24 @@ public class ChatPipeline {
         this.resilience = resilience;
     }
 
+    /**
+     * 不带路由回执的入口（内部调用与单元测试用）。
+     *
+     * <p>保留它不是为了兼容，而是为了让"我只关心管线跑通"的调用点
+     * 不必为了一个新参数改二十多处 —— 那种全量改动会把真正需要 review 的
+     * 差异淹没掉。生产路径由控制器传一个真实的 {@link RouteTrace}。
+     */
     public Mono<ChatResponse> execute(String apiKey, ChatRequest request, String traceId) {
+        return execute(apiKey, request, traceId, RouteTrace.ignored());
+    }
+
+    /**
+     * @param trace 路由回执，解析完成时写入；供 HTTP 层设置响应头。
+     *              它不参与任何业务判断 —— 传 {@code ignored()} 与传真实实例
+     *              的行为差异只有一个：外部能不能看到这次选了哪个任务。
+     */
+    public Mono<ChatResponse> execute(String apiKey, ChatRequest request, String traceId,
+                                      RouteTrace trace) {
         if (request.messages() == null || request.messages().isEmpty()) {
             // 显式校验而不是靠 Bean Validation：错误能沿现有链路变成 OpenAI 形状的 400，
             // 不需要再引入一层 @ControllerAdvice 来接管异常（见 README 的取舍说明）。
@@ -121,7 +139,7 @@ public class ChatPipeline {
         // 后面的配额、缓存、候选链、级联全部沿用原有逻辑。
         Route route;
         try {
-            route = resolveRoute(request);
+            route = resolveRoute(request, trace);
         } catch (RuntimeException e) {
             // ★ 必须显式转成 Mono.error。
             // 控制器把所有错误映射（状态码 + OpenAI 错误体）放在 onErrorResume 里，
@@ -152,7 +170,7 @@ public class ChatPipeline {
                                 // 不变量 A：命中同样要落账，但必须异步。
                                 // 旧实现这里是同步 ledger.record —— 命中本来是最快的路径，
                                 // 却在 Kafka 不可达时白等 max.block.ms，把优化点变成新瓶颈。
-                                recordAsync(traceId, apiKey, request, payload, 0.0, latency);
+                                recordAsync(traceId, apiKey, request, route.task(), payload, 0.0, latency);
                                 // 结算（F0）：缓存命中 = 完全没走上游 = 真实用量为 0。
                                 // 预扣的那笔必须**全额退还** —— 否则命中一次反而白扣一次配额，
                                 // 而"命中就省钱"正是缓存存在的全部理由。
@@ -167,7 +185,13 @@ public class ChatPipeline {
                 });
     }
 
+    /** 流式入口的"不带路由回执"版本，理由同 {@link #execute(String, ChatRequest, String)}。 */
     public Flux<StreamChunk> executeStream(String apiKey, ChatRequest request, String traceId) {
+        return executeStream(apiKey, request, traceId, RouteTrace.ignored());
+    }
+
+    public Flux<StreamChunk> executeStream(String apiKey, ChatRequest request, String traceId,
+                                           RouteTrace trace) {
         if (request.messages() == null || request.messages().isEmpty()) {
             return Flux.error(new IllegalArgumentException("messages 不能为空"));
         }
@@ -175,7 +199,7 @@ public class ChatPipeline {
         long estimatedTokens = tokenEstimator.estimatePrompt(request.messages());
         Route route;
         try {
-            route = resolveRoute(request);
+            route = resolveRoute(request, trace);
         } catch (RuntimeException e) {
             // 同 execute：同步抛出的异常绕过 onErrorResume，会被 Spring 变成 500。
             // 流式路径同样需要这条转换，否则"未知任务"在流式客户端那里是 500、非流式是 400 ——
@@ -193,7 +217,7 @@ public class ChatPipeline {
                     return cacheService.lookup(namespace, question)
                             .flatMapMany(hit -> {
                                 metrics.onCacheHit();
-                                recordAsync(traceId, apiKey, request,
+                                recordAsync(traceId, apiKey, request, route.task(),
                                         new ChatResponse("cache", "cache", hit.answer(),
                                                 new Usage(0, 0), true),
                                         0.0, 0);
@@ -237,7 +261,8 @@ public class ChatPipeline {
         AtomicLong spentTokens = new AtomicLong(0);
         // 被重试 / 转移丢弃的尝试：它们同样真的花了钱，必须各自落一条账（不变量 C）。
         // 整个请求共用一个（含级联升级那一段），理由同 spentTokens 的注释。
-        DiscardedAttempts discarded = new DiscardedAttempts(traceId, apiKey, request, tier, spentTokens);
+        DiscardedAttempts discarded = new DiscardedAttempts(traceId, apiKey, request,
+                route.task(), tier, spentTokens);
 
         return callWithFailover(tier.model(), request, discarded)
                 .flatMap(response -> {
@@ -257,7 +282,7 @@ public class ChatPipeline {
                         // usageOrEstimate 只在真实值缺失时才回退。
                         Usage firstUsage = usageOrEstimate(request, response);
                         spentTokens.addAndGet(firstUsage.total());
-                        recordAsync(traceId, apiKey, request,
+                        recordAsync(traceId, apiKey, request, route.task(),
                                 new ChatResponse(response.id(), tier.model(), response.content(),
                                         firstUsage, false, response.finishReason()),
                                 estimateCost(tier.model(), tier, firstUsage),
@@ -291,7 +316,7 @@ public class ChatPipeline {
                             ? response
                             : new ChatResponse(response.id(), response.model(), response.content(),
                                     usage, response.cacheHit(), response.finishReason());
-                    recordAsync(traceId, apiKey, request, ledgerRow,
+                    recordAsync(traceId, apiKey, request, route.task(), ledgerRow,
                             estimateCost(response.model(), tier, usage), latency);
                     if (!response.cacheHit()) {
                         // 不变量 B：缓存段按"实际服务的模型"划，不用请求档位划，
@@ -498,16 +523,18 @@ public class ChatPipeline {
         private final String traceId;
         private final String apiKey;
         private final ChatRequest request;
-        /** 请求级的档位，仅在"模型不在候选表里"时作为计价兜底。 */
+        /** 本次请求的任务，原样带进账本 —— 被丢弃的尝试也属于同一个任务。 */
+        private final String task;
         private final ModelTier tier;
         private final AtomicLong spentTokens;
         private final AtomicReference<ChatResponse> pending = new AtomicReference<>();
 
-        DiscardedAttempts(String traceId, String apiKey, ChatRequest request,
+        DiscardedAttempts(String traceId, String apiKey, ChatRequest request, String task,
                           ModelTier tier, AtomicLong spentTokens) {
             this.traceId = traceId;
             this.apiKey = apiKey;
             this.request = request;
+            this.task = task;
             this.tier = tier;
             this.spentTokens = spentTokens;
         }
@@ -531,7 +558,7 @@ public class ChatPipeline {
             }
             Usage usage = usageOrEstimate(request, stale);
             double cost = estimateCost(stale.model(), tier, usage);
-            recordAsync(traceId, apiKey, request, stale, cost, 0);
+            recordAsync(traceId, apiKey, request, task, stale, cost, 0);
             spentTokens.addAndGet(usage.total());
             log.warn("upstream attempt discarded by retry/failover and billed [model={} "
                             + "finish_reason={} usage={}]",
@@ -722,7 +749,7 @@ public class ChatPipeline {
 
                     ChatResponse snapshot = new ChatResponse("stream", model, collected.toString(),
                             usage, false, finishReason.get());
-                    recordAsync(traceId, apiKey, request, snapshot,
+                    recordAsync(traceId, apiKey, request, route.task(), snapshot,
                             estimateCost(model, tier, usage), latency);
                     writeCache(cacheNamespace(apiKey, model), question, collected.toString());
                     settleAmount.set(usage.total());
@@ -778,8 +805,11 @@ public class ChatPipeline {
      * <p>这条日志是排查"这个请求为什么走了贵模型"的第一个入口：它同时给出
      * 判定出的任务、判定来源（显式 / 推断 / 兜底）和具体命中的规则。
      */
-    private Route resolveRoute(ChatRequest request) {
+    private Route resolveRoute(ChatRequest request, RouteTrace trace) {
         Route route = routerService.resolve(request);
+        // 先写回执再记指标/日志：回执的消费者（响应头）在写 body 之前就要读到它。
+        // 这里不能反过来依赖"日志已经打了"，日志是给人看的，回执是给程序用的。
+        trace.record(route);
         metrics.onRoute(route.task(), route.source());
         log.info("route: model={} task={} source={} reason={}",
                 route.tier().model(), route.task(), route.source(), route.reason());
@@ -951,11 +981,12 @@ public class ChatPipeline {
      * 不是因为"整条链路是阻塞的"，而是因为 CostLedgerService.record 内部
      * 有一次已知会阻塞的 Kafka 调用，需要把它隔离出去。
      */
-    private void recordAsync(String traceId, String apiKey, ChatRequest request, ChatResponse response,
-                             double cost, long latencyMs) {
+    private void recordAsync(String traceId, String apiKey, ChatRequest request, String task,
+                             ChatResponse response, double cost, long latencyMs) {
         Usage u = response.usage() == null ? new Usage(0, 0) : response.usage();
-        Mono.fromRunnable(() -> ledger.record(traceId, apiKey, request.feature(), response.model(),
-                        response.cacheHit(), u.promptTokens(), u.completionTokens(), cost, latencyMs))
+        Mono.fromRunnable(() -> ledger.record(traceId, apiKey, request.feature(), task,
+                        response.model(), response.cacheHit(), u.promptTokens(),
+                        u.completionTokens(), cost, latencyMs))
                 .subscribeOn(Schedulers.boundedElastic())
                 .subscribe(null, e -> log.debug("cost ledger failed: {}", e.getMessage()));
     }

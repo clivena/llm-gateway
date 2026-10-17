@@ -77,6 +77,7 @@ src/main/java/com/llmgw/
 │   │                    # ProviderRegistry：model → **候选链**（F2，顺序即优先级）
 │   ├── router/          # RouterService：解析 Route（显式模型 / policy / 任务路由）
 │   │                    # TaskClassifier：显式 task → 规则推断 → default-task
+│   │                    # RouteTrace：路由回执（管线写、HTTP 层读 → 响应头）
 │   │                    # Route / TaskDecision / ModelTier / RoutingPolicy
 │   ├── resilience/      # UpstreamResilience：按 provider 的重试 + 熔断（F1）
 │   │                    # 转移谓词 failoverable = retryable ∪ {熔断打开}（F2）
@@ -222,10 +223,12 @@ python scripts/run-gateway-smoke.py
 | POST | `/v1/chat/completions` | OpenAI 兼容对话接口，支持 `stream: true`（SSE 逐字返回） |
 | GET | `/admin/status` | 依赖健康（Redis / Postgres）+ 当前生效策略 |
 | GET | `/admin/pricing` | 计费单价表 + 路由策略——面板上"为什么是这个价"的依据 |
-| GET | `/admin/ledger/recent?limit=` | 账本明细（limit 收口 1~200，避免被当全表导出用） |
+| GET | `/admin/ledger/recent?limit=` | 账本明细（limit 收口 1~200，避免被当全表导出用；含 `task` 列） |
 | GET | `/admin/ledger/summary` | 账本按租户汇总（对账口径） |
+| GET | `/admin/ledger/by-task` | 账本按**任务**汇总：哪个任务在花钱（`NULL` 显示为 `(none)`） |
 | GET | `/admin/quota/{apiKey}` | 指定租户当前周期的配额用量 |
 | GET | `/admin/circuit` | 各 provider 的重试 / 熔断状态与失败率（F1；F2 之后也是"为什么转移了"的第一诊断入口） |
+| GET | `/admin/route` | 当前生效的任务映射表（含真实档位）+ 本进程 `task × source` 命中分布 |
 | GET | `/dashboard` | 可视化控制台（同源托管） |
 | GET | `/actuator/prometheus` | Prometheus 指标（含 `llmgw_cache_hit` 等自定义指标） |
 
@@ -244,6 +247,21 @@ python scripts/run-gateway-smoke.py
   不静默兜底：否则调用方以为 `code` 生效了、实际走了 chat，只能翻账本才发现。
 - 不传 → 网关按规则推断；推断不出来落 `default-task`（推断是网关自己的判断，
   判错不该让请求失败）。
+
+响应头里的路由诊断信息（**不进 body**，body 保持纯 OpenAI 形状）：
+
+| 响应头 | 取值 | 说明 |
+|---|---|---|
+| `X-Route-Task` | `code` / `summarize` / `chat` / `explicit` / `n/a` | 本次请求被判定成什么任务 |
+| `X-Route-Source` | `explicit` / `inferred` / `fallback` / `policy` | 这个任务是怎么来的：客户端声明 / 网关推断 / 兜底 / 未启用任务路由 |
+
+两条使用约定：
+
+- **路由没解析成功时（参数错 / 未知任务）这两个头不会出现** —— 宁可没有，
+  也不写一个假的 `n/a` 让人以为"任务路由没开"。
+- 非 ASCII 任务名会被降级成 `_`（HTTP 头只保证 ASCII 可移植）。
+  原始值在 `/admin/route` 与 route 日志里。**它是诊断头，不是契约**，
+  不要拿它做计费或路由依据 —— 那边请用 `traceId` + 账本。
 
 `/admin/*` **全部只读**——不扣配额、不写账本、不改配置，与 `/v1` 主链路完全隔离，挂了也不影响对外服务。
 
@@ -475,7 +493,7 @@ A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来�
 
 ### 任务路由验证（按 task 选模型）
 
-**单元测试**：`mvn -o clean test` → **175 passed**（F2 的 141 → 175，+34）。
+**单元测试**：`mvn -o clean test` → **200 passed**（F3 交付时 175 → step-22 +11 → step-23 +14）。
 
 | 层面 | 断言 |
 |---|---|
@@ -483,18 +501,32 @@ A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来�
 | 路由 | 任务命中 / 推断命中 / 推断未配置落 default / 未知**显式**任务 400 / 显式模型优先 / 开关关闭走 policy |
 | 启动校验 | `default-task` 未声明、task 的 model 不在 candidates、enabled 但表为空、`classifier` 取值非法、`policy=TASK_BASED` 已被删除 |
 | 编排 | 非流式与流式**都**用 `route.tier()`；缓存段跟着模型走；未知任务 → 400（且必须是**流内错误**）；指标真的写了 |
+| 留证（R2） | 回执两条路径都写 / 失败时留空；响应头真的发出（含流式）；非 ASCII 降级；账本 task 透传到仓储与 Kafka；`/admin/route` 用运行时档位 |
 
-**真机**：`scripts/check-task-routing.py` —— **8/8 PASS**（step-22 补齐）。
+**真机**：`scripts/check-task-routing.py` —— **13/13 PASS**（A~F 段 8 条 + step-23 新增 G 段 5 条）。
 
 > 交付 F3 时这一节写的是"未实跑"：容器起不来（Docker Desktop 被沙箱安全策略阻止，
 > 禁 `wsl.exe` 且不可绕过）。后来容器恢复正常，补跑结果如上 —— 没有把没跑过的
 > 写成跑过了，也没有在跑过之后继续留着"未跑"的旧说法。
+
+```
+✓ G1 非流式响应头带 X-Route-Task / X-Route-Source
+✓ G2 推断来源可区分（inferred 而不是 explicit）
+✓ G3 流式响应头同样带路由结果
+✓ G4 账本按请求写入 task 列
+✓ G5 /admin/route 给出映射表与命中分布
+```
 
 复跑：`docker compose up -d && python scripts/check-task-routing.py`
 
 一条只有真机能给的证据：**C1 同时断言"HTTP 400"和"上游零调用"**。
 只断言状态码不够 —— 如果实现是在发完请求之后才发现任务名不对，
 状态码可能仍然是 400，但钱已经花掉了。
+
+G4 同理：它用**这次响应的 `traceId`** 去库里找那一行，
+同时证明"响应与账本属于同一次请求"和"task 跟着这次判定走"。
+第一版用"账本 id 递增"做判据，而 `/admin/ledger/recent` 的 SELECT 里没有 `id` ——
+判据恒假、断言恒失败（见 step-23 第 6 节）。
 
 ### 复查修复（step-22）
 
@@ -669,16 +701,25 @@ A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来�
     这是**正确行为**（不同模型的答案不能混用），但要预期。
 34. **`classifier: model` 未实现**，配置它会在启动时直接失败。这是刻意的：
     静默退回规则会让配的人以为模型分类已生效。
-35. **响应头 `X-Route-Task` / `X-Route-Source` 未做**：`ChatResponse` 有 22 处构造点，
-    为两个诊断头改 record 不划算，留到 R2 用 exchange attribute 做。
-36. **账本没有 `task` 列**：现在只能从 `model` 反推当时走了什么任务，
-    而"为什么走这个任务"（source / reason）只在日志里。
-37. **`/admin/route` 只读端点未做**：排错时还是得看日志。
+35. ~~**响应头 `X-Route-Task` / `X-Route-Source` 未做**~~ → **已做（step-23）**：
+    用 `RouteTrace` 回执传递，**没有**改 `ChatResponse`（22 处构造点）。
+    非 ASCII 任务名降级为 `_`；路由解析失败时不设头。
+36. ~~**账本没有 `task` 列**~~ → **已做（step-23）**：`cost_ledger.task` 与 `feature` 语义正交；
+    未发生任务判定时写 `NULL`（不是空串——否则 `GROUP BY` 会造出一个假桶）。
+37. ~~**`/admin/route` 只读端点未做**~~ → **已做（step-23）**：映射表取自运行时档位，
+    附本进程 `task × source` 命中分布。
 38. **被丢弃尝试的账本行 `latency_ms` 记 0**：单次尝试的耗时没有单独计时，
     而这一行的用途是成本、不是延迟分析（延迟由 `latency` 指标单独统计，口径是整条请求）。
     真要按尝试看延迟，得把计时器下沉到 `callUpstream` 里。
 39. **流式缓存命中发的是"内容 + 收尾"两个分片**：`usage` 是 0/0、`finish_reason` 是 `stop`。
     这是对的（网关交出去的是完整答案、且没走上游），但**不要**用它反推上游的 token 消耗。
+40. **`X-Route-*` 可能被反向代理丢弃或改写**：它是诊断头，不是契约。
+    调用方不能拿它做计费或路由依据 —— 那边请用 `traceId` + 账本。
+41. **`/admin/route` 的 `hits` 是进程内计数**：重启归零。跨重启的趋势归 Prometheus，
+    两者用途不同，不要把两个数合成一个"总命中"。
+42. **已有数据库必须手动应用 migration**：`db/schema.sql` 挂在 initdb 下，
+    **只在数据目录为空时执行**。只改 schema.sql 会让现有环境写账本时静默失败
+    （异常被吞成 warn）。见 `db/migrations/001-cost-ledger-task.sql`。
 
 ---
 
@@ -703,6 +744,8 @@ A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来�
 11. **同步抛出的异常绕过 `onErrorResume`（任务路由）**——`resolveRoute` 在 `execute` 里是**同步**调用的（发生在返回 Mono 之前），所以"未知任务"抛出的 `IllegalArgumentException` 不是"流里的错误"，控制器的 `onErrorResume` 根本不执行：异常冒泡给 Spring，客户端收到 **500**，而设计写的是 **400**。单元测试里它的表现是 **ERROR 而不是 FAILURE**（`StepVerifier` 连 Mono 都没拿到）——这一点很关键，如果只写 `assertThrows(IllegalArgumentException.class, ...)`，测试会全绿而线上仍然是 500。教训：**"异常类型对"和"HTTP 状态码对"是两件事**，断言必须打到 `OpenAiProtocol.statusOf(e)` 那一层。
 
 12. **配置项存在，但没有代码读它（任务路由）**——`classifier: off` 是我自己写进方案与配置里的，代码却没读这个值；`classifier: model` 更是只有名字、没有实现。这类"配置存在但无效"比"配置项不存在"更难排查：用户改了配置、重启成功、行为不变，只会怀疑自己理解错了语义。修法是两头堵——`off` 真正实现（关推断、不关显式任务），其余取值在**启动时直接拒绝**并说明原因。
+13. **验证脚本"假绿"：只跑了 3 条却打印"全部通过"（step-23）**——在改源码的同时跑了 `check-failover.py`：A 段用的是改之前编译好的类，B/C 段重启服务时编译失败，`phase()` 只打一行"本段中止"就返回；而汇总的判断是 `ok = bool(results) and all(good)` —— **没跑 = 没记录 = 不影响 ok**。于是 10 条断言一条没执行，结论却是绿的，退出码还是 0。修法三件套：分段启动失败写一条 FAIL 记录、断言条数少于下限直接判失败、`raise SystemExit(main())` 让退出码反映结果。教训：**验证工具本身也需要被验证**；假绿比没有脚本更危险，因为人会把它当成"已验证"。
+14. **判据里用到的字段，要先确认它真的在返回里**——G4 第一版用"账本 id 递增"判断新行，而 `/admin/ledger/recent` 的 SELECT 里根本没有 `id`，于是判据恒假、断言恒定失败。同一类写法反过来（`>= 0`）就会变成恒真，那才是真正危险的版本。改成用响应的 `traceId` 关联后，断言反而更强了：它同时证明响应与账本属于同一次请求。
 
 ---
 
@@ -730,6 +773,7 @@ A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来�
 | [20](./docs/step-20-cross-provider-failover.md) | **跨 provider 故障转移**：候选链数据结构 + `failoverable` 谓词 + 请求级预算扣减 |
 | [21](./docs/step-21-task-based-routing.md) | **按任务选模型**：三层判定 + 规则分类器 + 任务映射表 + 开关只能有一个 |
 | [22](./docs/step-22-review-fixes-2.md) | **复查修复**：4xx 不再熔断 provider + 被丢弃的尝试也记账 + 流式收尾帧 + 计价档位 |
+| [23](./docs/step-23-r2-observability.md) | **R2 留证**：路由响应头（RouteTrace）+ 账本 `task` 列 + `/admin/route`；顺带修掉脚本"假绿" |
 
 ---
 

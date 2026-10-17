@@ -2,8 +2,11 @@ package com.llmgw.api;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.llmgw.api.dto.ChatRequest;
+import com.llmgw.api.dto.ChatResponse;
 import com.llmgw.core.pipeline.ChatPipeline;
 import com.llmgw.core.protocol.StreamChunk;
+import com.llmgw.core.router.Route;
+import com.llmgw.core.router.RouteTrace;
 import com.llmgw.observability.TraceIdFilter;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpStatus;
@@ -74,7 +77,16 @@ public class ChatController {
                                 ServerHttpResponse response) {
         response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
         response.setStatusCode(HttpStatus.OK);
-        return pipeline.execute(key, request, traceId)
+        // 路由回执：管线解析完路由会写进它，这里读出来设响应头。
+        // 注意 pipeline.execute(...) 的方法体是**同步执行**的（route 在返回 Mono 之前
+        // 就解析完了，见 ChatPipeline.execute 的 try/catch 那段），
+        // 所以这里设头不必等订阅 —— 顺带让 429/502 这类错误响应也能带上路由信息。
+        // 若哪天真把解析挪进 Mono.defer，这些头会静默消失：ChatControllerRouteHeaderTest
+        // 就是钉住这一点的。
+        RouteTrace trace = new RouteTrace();
+        Mono<ChatResponse> call = pipeline.execute(key, request, traceId, trace);
+        applyRouteHeaders(response, trace);
+        return call
                 .flatMap(resp -> {
                     // 缓存命中走响应头，不进 body —— 见 OpenAiProtocol 规则 A。
                     // 必须在 writeWith 之前设置：首次写出后头部就冻结了。
@@ -115,7 +127,9 @@ public class ChatController {
         //
         // 用 handle 而不是 map：分片有两种形态（文本增量 / 纯用量），
         // 且都可能被丢弃，map 不允许返回"零个"结果。
-        Flux<Flux<DataBuffer>> frames = pipeline.executeStream(key, request, traceId)
+        // 路由回执：与 complete 同一条理由（解析在返回 Flux 之前就同步完成了）。
+        RouteTrace trace = new RouteTrace();
+        Flux<Flux<DataBuffer>> frames = pipeline.executeStream(key, request, traceId, trace)
                 .handle((StreamChunk chunk, SynchronousSink<Flux<DataBuffer>> sink) -> {
                     if (chunk.hasDelta()) {
                         // model 取自分片而不是 request.resolvedModel()：
@@ -147,7 +161,57 @@ public class ChatController {
                     setStatusIfUncommitted(response, OpenAiProtocol.statusOf(e));
                     return Flux.just(toSseFrame(asJson(OpenAiProtocol.errorPayload(e))));
                 });
+        // 必须在 writeAndFlushWith 之前：首次写出后头部就冻结了（流式尤其没有第二次机会）。
+        applyRouteHeaders(response, trace);
         return response.writeAndFlushWith(frames);
+    }
+
+    /**
+     * 把路由结果写进响应头。
+     *
+     * <p>只设两个头，不设"用了哪个模型"：模型会在级联升级时变化，
+     * 一个在请求开始就写下的头会与最终真正服务的模型不符 ——
+     * 那种"看起来对、实际错"的诊断信息比没有更坏。
+     * 真实模型本来就在响应体与分片里（F5 已保证按真实模型填）。
+     */
+    private static void applyRouteHeaders(ServerHttpResponse response, RouteTrace trace) {
+        Route route = trace.get();
+        if (route == null) {
+            // 路由没解析成功（messages 为空 / 未知任务）—— 这时不设头。
+            // 设一个 n/a 会让人以为"任务路由没生效"，而真实原因是这次请求根本没走到路由。
+            return;
+        }
+        String task = headerSafe(route.task());
+        String source = headerSafe(route.source());
+        if (task != null) {
+            response.getHeaders().set(OpenAiProtocol.ROUTE_TASK_HEADER, task);
+        }
+        if (source != null) {
+            response.getHeaders().set(OpenAiProtocol.ROUTE_SOURCE_HEADER, source);
+        }
+    }
+
+    /**
+     * 响应头值的字符清洗。
+     *
+     * <p>HTTP 头是字节串，规范只保证 ASCII 可见字符可移植；把中文任务名
+     * 直接塞进去，轻则客户端解成乱码，重则在 Netty 里抛
+     * {@code IllegalArgumentException} —— 那会让一次**本来成功**的请求变成 500。
+     * 诊断信息绝不能有让请求失败的权力，所以这里宁可降级成 {@code _}。
+     *
+     * <p>信息并没有丢：原始任务名在 {@code /admin/route} 与 route 日志里都是原文。
+     * 约定上任务名应当是 ASCII 标识符（code / json / summarize / chat）。
+     */
+    private static String headerSafe(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder(raw.length());
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            sb.append(c >= 0x20 && c < 0x7F ? c : '_');
+        }
+        return sb.toString();
     }
 
     private static void setStatusIfUncommitted(ServerHttpResponse response, HttpStatus status) {

@@ -16,8 +16,8 @@ import com.llmgw.core.resilience.UpstreamCircuitOpenException;
 import com.llmgw.core.resilience.UpstreamEmptyResponseException;
 import com.llmgw.core.resilience.UpstreamResilience;
 import com.llmgw.core.router.ModelTier;
+import com.llmgw.core.router.Route;
 import com.llmgw.core.router.RouterService;
-import com.llmgw.core.router.RoutingPolicy;
 import com.llmgw.core.token.TokenEstimator;
 import com.llmgw.observability.GatewayMetrics;
 import org.slf4j.Logger;
@@ -116,9 +116,21 @@ public class ChatPipeline {
         long estimatedTokens = tokenEstimator.estimatePrompt(request.messages());
         long start = System.currentTimeMillis();
         // 档位提前解析：缓存 namespace 需要模型维度。
-        // 放在配额之前是安全的 —— RouterService.pick 是纯函数，不做 IO。
-        ModelTier tier = resolveTier(request);
-        String namespace = cacheNamespace(apiKey, tier.model());
+        // 放在配额之前是安全的 —— 路由与任务判定都是纯函数，不做 IO。
+        // 任务路由（按 task 选模型）就发生在这里；它只影响下面这个 route.tier()，
+        // 后面的配额、缓存、候选链、级联全部沿用原有逻辑。
+        Route route;
+        try {
+            route = resolveRoute(request);
+        } catch (RuntimeException e) {
+            // ★ 必须显式转成 Mono.error。
+            // 控制器把所有错误映射（状态码 + OpenAI 错误体）放在 onErrorResume 里，
+            // 而这里若**同步抛出**，就不再是"流里的错误"，onErrorResume 根本不会执行 ——
+            // 异常会冒泡给 Spring 变成 500，于是"未知任务 → 400"这条设计直接失效，
+            // 用户还会以为自己的请求触发了服务端故障。任务名写错正是最容易踩到它的地方。
+            return Mono.error(e);
+        }
+        String namespace = cacheNamespace(apiKey, route.tier().model());
 
         return quotaService.tryConsume(apiKey, estimatedTokens)
                 .flatMap(allowed -> {
@@ -149,7 +161,7 @@ public class ChatPipeline {
                             })
                             .switchIfEmpty(Mono.defer(() -> {
                                 metrics.onCacheMiss();
-                                return dispatch(apiKey, request, question, tier, start, traceId,
+                                return dispatch(apiKey, request, question, route, start, traceId,
                                         estimatedTokens);
                             }));
                 });
@@ -161,8 +173,16 @@ public class ChatPipeline {
         }
         String question = questionOf(request);
         long estimatedTokens = tokenEstimator.estimatePrompt(request.messages());
-        ModelTier tier = resolveTier(request);
-        String namespace = cacheNamespace(apiKey, tier.model());
+        Route route;
+        try {
+            route = resolveRoute(request);
+        } catch (RuntimeException e) {
+            // 同 execute：同步抛出的异常绕过 onErrorResume，会被 Spring 变成 500。
+            // 流式路径同样需要这条转换，否则"未知任务"在流式客户端那里是 500、非流式是 400 ——
+            // 同一个错误两种状态码，是最难向调用方解释的那类不一致。
+            return Flux.error(e);
+        }
+        String namespace = cacheNamespace(apiKey, route.tier().model());
 
         return quotaService.tryConsume(apiKey, estimatedTokens)
                 .flatMapMany(allowed -> {
@@ -188,14 +208,18 @@ public class ChatPipeline {
                                 // 非流式分支里有 onCacheMiss，流式分支曾经漏了 ——
                                 // 结果是指标统计偏低（实测 3 次请求只记到 2 次 miss）
                                 metrics.onCacheMiss();
-                                return streamDispatch(apiKey, request, question, tier, traceId,
+                                return streamDispatch(apiKey, request, question, route, traceId,
                                         estimatedTokens);
                             }));
                 });
     }
 
     private Mono<ChatResponse> dispatch(String apiKey, ChatRequest request, String question,
-                                         ModelTier tier, long start, String traceId, long reserved) {
+                                         Route route, long start, String traceId, long reserved) {
+        // 只在这里把 route 拆成 tier，下面整个函数体保持原样。
+        // 逐处把 tier 改成 route.tier() 看起来更"干净"，但漏改一处不会编译报错，
+        // 只会静默用错变量 —— 那种错误要靠真机才能发现。
+        ModelTier tier = route.tier();
         long begin = System.currentTimeMillis();
         // 本次请求实际消耗的总 token，可能来自**多次**上游调用（重试、故障转移、级联升级）。
         // 用 AtomicLong 在这里汇合所有路径的用量，正好是配额结算需要的口径：
@@ -526,7 +550,8 @@ public class ChatPipeline {
     }
 
     private Flux<StreamChunk> streamDispatch(String apiKey, ChatRequest request, String question,
-                                              ModelTier tier, String traceId, long reserved) {
+                                              Route route, String traceId, long reserved) {
+        ModelTier tier = route.tier();
         AtomicBoolean emitted = new AtomicBoolean(false);
         // 级联升级后实际服务的是更强的模型，账本与响应分片都必须记真实模型名，
         // 否则会出现"按便宜模型计价"的归因错误、以及客户端看到错的模型。
@@ -636,11 +661,22 @@ public class ChatPipeline {
         }
     }
 
-    private ModelTier resolveTier(ChatRequest request) {
-        if (!"auto".equals(request.resolvedModel())) {
-            return new ModelTier(request.resolvedModel(), "EXPLICIT", 0.0, 1.0);
-        }
-        return routerService.pick(RoutingPolicy.valueOf(properties.getRouter().getPolicy()));
+    /**
+     * 解析路由，并在这里统一记录"为什么这么选"。
+     *
+     * <p>流式与非流式都经过这里，所以日志和指标只写一处。如果分别放进
+     * dispatch / streamDispatch，很快就会出现"流式那条忘了记"的静默分叉 ——
+     * 而这种分叉在单元测试里往往也是各测一条、看不出来。
+     *
+     * <p>这条日志是排查"这个请求为什么走了贵模型"的第一个入口：它同时给出
+     * 判定出的任务、判定来源（显式 / 推断 / 兜底）和具体命中的规则。
+     */
+    private Route resolveRoute(ChatRequest request) {
+        Route route = routerService.resolve(request);
+        metrics.onRoute(route.task(), route.source());
+        log.info("route: model={} task={} source={} reason={}",
+                route.tier().model(), route.task(), route.source(), route.reason());
+        return route;
     }
 
     /**

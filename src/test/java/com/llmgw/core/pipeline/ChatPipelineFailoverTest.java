@@ -14,6 +14,7 @@ import com.llmgw.core.quota.QuotaService;
 import com.llmgw.core.resilience.UpstreamCircuitOpenException;
 import com.llmgw.core.resilience.UpstreamResilience;
 import com.llmgw.core.router.ModelTier;
+import com.llmgw.core.router.Route;
 import com.llmgw.core.router.RouterService;
 import com.llmgw.core.token.TokenEstimator;
 import com.llmgw.observability.GatewayMetrics;
@@ -119,6 +120,10 @@ class ChatPipelineFailoverTest {
         when(routerService.shouldEscalate(any(ModelTier.class), any(), anyBoolean())).thenReturn(false);
         when(routerService.escalateFrom(any(ModelTier.class)))
                 .thenReturn(new ModelTier(MODEL, "CHEAP", 0.0, 0.5));
+        // 任务路由：本组测的是转移与预算，把路由固定成单模型 ——
+        // 让任务判定插手会把"调用了几次"的断言变得难以归因。
+        when(routerService.resolve(any())).thenReturn(
+                new Route(new ModelTier(MODEL, "CHEAP", 0.0, 0.5), "chat", "fallback", "test"));
 
         buildPipeline();
     }
@@ -130,7 +135,7 @@ class ChatPipelineFailoverTest {
 
     private ChatRequest request() {
         return new ChatRequest(MODEL, false, 0.0, 64, null, null, null, null,
-                List.of(new ChatMessage("user", "什么是故障转移")), "test");
+                List.of(new ChatMessage("user", "什么是故障转移")), "test", null);
     }
 
     /** 声明成 long：estimatePrompt 若返回 int，{@code List.of(...)} 会变成 List&lt;Integer&gt;，

@@ -128,6 +128,34 @@ gateway:
         tier: STRONG
         cost-per-1k: 0.0600
         quality-score: 0.90
+
+    # ★ 按任务选模型。规则是**覆盖 + 兜底**：命中任务就用 tasks 里的模型，
+    #   没命中（或推断不出）落 default-task。它和 policy 不是并列关系 ——
+    #   开启之后 policy 不再参与，所以刻意没有再保留一个 policy=TASK_BASED：
+    #   同一件事两个开关，四种组合里必有两种语义不明。
+    #
+    #   三条启动期校验（写错就起不来，而不是运行时静默走错模型）：
+    #     ① default-task 必须在 tasks 里声明；
+    #     ② 每个任务指定的 model 必须已存在于上面的 candidates
+    #        （不在候选表里就没有 quality-score，级联升级会永远找不到更强档位）；
+    #     ③ enabled 时 tasks 不能为空。
+    #
+    #   这里默认关闭，但保留一份与上面 candidates 对应的示例配置：
+    #   把 enabled 改成 true 就能直接生效，不必再猜格式。
+    task-routing:
+      enabled: false
+      default-task: chat
+      # rule = 纯规则推断（零延迟零成本）；off = 只认客户端显式声明的 task。
+      classifier: rule
+      tasks:
+        code:
+          model: gpt-4o
+        extract-json:
+          model: gpt-4o-mini
+        summarize:
+          model: gpt-4o-mini
+        chat:
+          model: gpt-4o-mini
   # 计费单价（元 / 1K tokens）。★ 示例值，请按你自己的实际账单口径替换。
   # 没有配置单价的模型，会回退到 ModelTier.costPer1k 按总 token 估算。
   pricing:

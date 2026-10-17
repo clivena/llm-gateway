@@ -13,6 +13,7 @@ import com.llmgw.core.quota.QuotaService;
 import com.llmgw.core.resilience.UpstreamCircuitOpenException;
 import com.llmgw.core.resilience.UpstreamResilience;
 import com.llmgw.core.router.ModelTier;
+import com.llmgw.core.router.Route;
 import com.llmgw.core.router.RouterService;
 import com.llmgw.core.token.TokenEstimator;
 import com.llmgw.observability.GatewayMetrics;
@@ -101,6 +102,9 @@ class ChatPipelineResilienceTest {
         when(cheapAdapter.name()).thenReturn("deepseek");
         when(strongAdapter.name()).thenReturn("deepseek");
         when(routerService.shouldEscalate(any(ModelTier.class), any(), anyBoolean())).thenReturn(false);
+        // 任务路由：本组测的是重试与熔断，路由固定成单模型（理由同 FailoverTest）。
+        when(routerService.resolve(any())).thenReturn(
+                new Route(new ModelTier(MODEL, "CHEAP", 0.0, 0.5), "chat", "fallback", "test"));
 
         buildPipeline();
     }
@@ -113,7 +117,7 @@ class ChatPipelineResilienceTest {
 
     private ChatRequest request() {
         return new ChatRequest(MODEL, false, 0.0, 64, null, null, null, null,
-                List.of(new ChatMessage("user", "什么是语义缓存")), "test");
+                List.of(new ChatMessage("user", "什么是语义缓存")), "test", null);
     }
 
     private long reserved() {

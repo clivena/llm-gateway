@@ -44,6 +44,13 @@
   旁路：TraceIdFilter 生成/透传 traceId · GatewayMetrics 暴露 Prometheus 指标
         AdminController 提供只读运维接口（供 dashboard 读取真实数据）
 
+  任务路由（在 ① 之前，只决定"用哪个模型"，不决定"怎么调这个模型"）：
+        model=auto → [显式 task] → [规则推断] → [default-task] → task→model 映射表
+        · 只替换 resolveRoute 的输出，下游（候选链 / 重试熔断 / 级联 / 配额）一行不改
+        · 显式模型最优先：用户点名了就不替换，否则是未经同意的替换与计费
+        · 未知的**显式**任务 → 400；未知的**推断**任务 → 落 default（网关判错不该让请求失败）
+        · 缓存段是 apiKey:model，任务换了模型就天然不串段（不变量 B 继续成立）
+
   韧性（F1，落在 ④ 与 ⑤ 的内侧，按 provider 各一套）：
         timeouts → CircuitBreaker → Retry → 真实上游调用
         · 熔断在内、重试在外 —— 熔断要看到每一次尝试，否则失败率被重试稀释
@@ -68,7 +75,9 @@ src/main/java/com/llmgw/
 │   ├── pipeline/        # ChatPipeline：一次请求的完整编排
 │   ├── protocol/        # ProviderAdapter 抽象 + OpenAiAdapter 实现
 │   │                    # ProviderRegistry：model → **候选链**（F2，顺序即优先级）
-│   ├── router/          # RouterService / RoutingPolicy / ModelTier 分级路由
+│   ├── router/          # RouterService：解析 Route（显式模型 / policy / 任务路由）
+│   │                    # TaskClassifier：显式 task → 规则推断 → default-task
+│   │                    # Route / TaskDecision / ModelTier / RoutingPolicy
 │   ├── resilience/      # UpstreamResilience：按 provider 的重试 + 熔断（F1）
 │   │                    # 转移谓词 failoverable = retryable ∪ {熔断打开}（F2）
 │   ├── cache/           # SemanticCacheService + Redis 向量检索实现
@@ -220,13 +229,29 @@ python scripts/run-gateway-smoke.py
 | GET | `/dashboard` | 可视化控制台（同源托管） |
 | GET | `/actuator/prometheus` | Prometheus 指标（含 `llmgw_cache_hit` 等自定义指标） |
 
+两个**不属于 OpenAI 协议**的请求字段（本网关的私有扩展，普通 OpenAI 客户端忽略即可）：
+
+| 字段 | 作用 |
+|---|---|
+| `feature` | 业务线标签，**只用于成本归因**（落 `cost_ledger.feature`）。例：`resume-tailor` |
+| `task` | 这次请求需要什么能力，网关据此选模型。取值由任务表决定，默认 `code` / `extract-json` / `summarize` / `chat` |
+
+`task` 的规则：
+
+- **只在 `model=auto` 时生效**。显式写了 model 就以 model 为准 —— 用户点名了模型，
+  网关不能因为"这个任务更适合别的模型"就换掉它（那是未经同意的替换与计费）。
+- 传了但**没在任务表里声明** → `400 invalid_request_error`，错误体列出可用任务。
+  不静默兜底：否则调用方以为 `code` 生效了、实际走了 chat，只能翻账本才发现。
+- 不传 → 网关按规则推断；推断不出来落 `default-task`（推断是网关自己的判断，
+  判错不该让请求失败）。
+
 `/admin/*` **全部只读**——不扣配额、不写账本、不改配置，与 `/v1` 主链路完全隔离，挂了也不影响对外服务。
 
 **错误状态码约定**（`/v1/chat/completions`）：
 
 | 状态码 | 场景 |
 |---|---|
-| 400 | 请求不合法——`messages` 为空、`model` 不在服务范围（`error.type = invalid_request_error`） |
+| 400 | 请求不合法——`messages` 为空、`model` 不在服务范围、**`task` 未在任务表里声明**（`error.type = invalid_request_error`） |
 | 429 | 配额超额（`error.type = rate_limit_exceeded`） |
 | 502 | 上游/适配层异常：连不上上游、上游返回非 2xx、上游报错、空响应体（`error.type = upstream_error`） |
 | 503 | **熔断器打开**——请求根本没发给上游。F2 之后也包括"整条候选链都熔断"（`error.type = circuit_open`，F1） |
@@ -448,6 +473,28 @@ A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来�
 - **"桩A 3→3"**（C2）—— 证明熔断打开的候选是被**跳过**而不是"试一次被拒再换家"。
   后者每次请求都会白扣一份预算，于是备选只剩 1 次重试机会 —— 一个静默的体验退化。
 
+### 任务路由验证（按 task 选模型）
+
+**单元测试**：`mvn -o clean test` → **175 passed**（F2 的 141 → 175，+34）。
+
+| 层面 | 断言 |
+|---|---|
+| 判定 | 显式优先；大小写/空白归一化；代码围栏、符号**组**、强关键词；JSON 需格式提示；长文阈值；只看最后一条 user；确定性；不抛异常；`classifier=off` 仍认显式 task |
+| 路由 | 任务命中 / 推断命中 / 推断未配置落 default / 未知**显式**任务 400 / 显式模型优先 / 开关关闭走 policy |
+| 启动校验 | `default-task` 未声明、task 的 model 不在 candidates、enabled 但表为空、`classifier` 取值非法、`policy=TASK_BASED` 已被删除 |
+| 编排 | 非流式与流式**都**用 `route.tier()`；缓存段跟着模型走；未知任务 → 400（且必须是**流内错误**）；指标真的写了 |
+
+**真机**：`scripts/check-task-routing.py`（8 条断言，A~F 六段）本轮**未实跑** ——
+它需要 Redis（配额走 Redis + Lua，没有开关可绕开），而本机 Docker Desktop 启动
+被沙箱安全策略阻止（禁 `wsl.exe`，不可绕过）。脚本自身已通过语法检查与前置检查：
+没有 Redis 时明确提示 `docker compose up -d` 并以退出码 2 结束，而不是崩栈。
+
+复跑：`docker compose up -d && python scripts/check-task-routing.py`
+
+一条只有真机能给的证据：**C1 同时断言"HTTP 400"和"上游零调用"**。
+只断言状态码不够 —— 如果实现是在发完请求之后才发现任务名不对，
+状态码可能仍然是 400，但钱已经花掉了。
+
 ---
 
 ## 已知边界（诚实清单）
@@ -583,6 +630,28 @@ A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来�
     第 3 次尝试被当场拒绝，于是那一次请求的失败类型是 `circuit_open` 而不是 `upstream_error`。
     这是对的（网关真的没发那次请求），但**排查时别把两者当互斥**。
 
+### 任务路由新增的边界
+
+28. **任务表是静态配置**，不支持热更新。要热更得让 `db/schema.sql` 里那张一直空着的
+    `model_route` 表接管 —— 它当初就是为"热更新 / 按租户差异化"留的。
+29. **新增任务必须改代码**：推断规则写在 `TaskClassifier` 里，配置只能给已存在的任务换模型。
+    目前不支持"纯配置加一个新任务"。
+30. **只看最后一条 user 消息**：多轮对话里如果第一轮定了任务、后面都在追问，
+    会被判成 `default-task`。这是刻意的（成本要 O(1)），不是漏实现。
+31. **任务不影响采样参数**：`task=extract-json` 不会自动加 `response_format`、也不调温度。
+    它只回答"用哪个模型"。
+32. **没有 per-task 预算**：任务不参与配额。成本控制仍归 quota —— 两件事揉在一起，
+    排查时说不清是"选错模型"还是"配额算错"。
+33. **缓存命中率会下降**：同一问题在"声明 code"和"不声明"下走不同模型、不同缓存段。
+    这是**正确行为**（不同模型的答案不能混用），但要预期。
+34. **`classifier: model` 未实现**，配置它会在启动时直接失败。这是刻意的：
+    静默退回规则会让配的人以为模型分类已生效。
+35. **响应头 `X-Route-Task` / `X-Route-Source` 未做**：`ChatResponse` 有 22 处构造点，
+    为两个诊断头改 record 不划算，留到 R2 用 exchange attribute 做。
+36. **账本没有 `task` 列**：现在只能从 `model` 反推当时走了什么任务，
+    而"为什么走这个任务"（source / reason）只在日志里。
+37. **`/admin/route` 只读端点未做**：排错时还是得看日志。
+
 ---
 
 ## 踩过的坑（都是真实调试记录）
@@ -602,6 +671,10 @@ A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来�
 8. **Mockito 的 `anyString()` 不匹配 `null`（F1）**——`ChatPipelineQuotaSettleTest` 里 8 条断言全红，报的却是一个看不懂的 NPE：管线用 `adapter.name()` 做熔断器实例键，而那个 mock 没桩 `name()` → 返回 `null` → `anyString()` 不匹配 → 桩未生效 → 走默认返回 `null`。一个方法返回值参与后续控制流时，漏桩它会以**另一个地方的 NPE** 的形式出现。
 9. **候选链根本存不下来：数据结构先于算法（F2）**——`ProviderRegistry.byModel` 原本是 `Map<String, ProviderAdapter>`，用 `putIfAbsent` + `warn 忽略`，**同模型的第二家 provider 会被丢掉**。配置写对、启动日志也打了、请求也不报错，只是第二家永远用不到。如果先写完转移逻辑再来改这本就不会发现的：**单测会全绿而真机永远不转移**。教训：加"多候选"这类能力时，**先确认承载它的数据结构能表达出来**，再写算法。
 10. **`onErrorResume` 的位置决定了转移能不能生效（F2）**——F1 把"空正文还原成响应"写在 `callUpstream` **内部**（`onErrorResume(UpstreamEmptyResponseException.class, e -> Mono.just(e.response()))`）。到 F2 就出事：**还原成一个成功值之后，外层拿到的就是成功，再没有机会去问下一家** —— "换个部署就能拿到正常答案"的请求被当成"上游明确说了它答不出"直接交付。`emptyAnswerTriggersFailover` 第一次跑就是这样红的（`predicate failed on value: content=, finishReason=length`）。修法是把还原从"单次调用内部"挪到**整条候选链的末端**（`terminal`）：**先穷尽转移，再还原响应**。
+
+11. **同步抛出的异常绕过 `onErrorResume`（任务路由）**——`resolveRoute` 在 `execute` 里是**同步**调用的（发生在返回 Mono 之前），所以"未知任务"抛出的 `IllegalArgumentException` 不是"流里的错误"，控制器的 `onErrorResume` 根本不执行：异常冒泡给 Spring，客户端收到 **500**，而设计写的是 **400**。单元测试里它的表现是 **ERROR 而不是 FAILURE**（`StepVerifier` 连 Mono 都没拿到）——这一点很关键，如果只写 `assertThrows(IllegalArgumentException.class, ...)`，测试会全绿而线上仍然是 500。教训：**"异常类型对"和"HTTP 状态码对"是两件事**，断言必须打到 `OpenAiProtocol.statusOf(e)` 那一层。
+
+12. **配置项存在，但没有代码读它（任务路由）**——`classifier: off` 是我自己写进方案与配置里的，代码却没读这个值；`classifier: model` 更是只有名字、没有实现。这类"配置存在但无效"比"配置项不存在"更难排查：用户改了配置、重启成功、行为不变，只会怀疑自己理解错了语义。修法是两头堵——`off` 真正实现（关推断、不关显式任务），其余取值在**启动时直接拒绝**并说明原因。
 
 ---
 
@@ -627,6 +700,7 @@ A1/A2 只把那个坏候选的**位置**换一下（链尾 / 链首），用来�
 | [18](./docs/step-18-reasoning-model-failure-semantics.md) | **推理型模型的失败语义**：`finish_reason` 透传 + 配额 reserve-then-settle |
 | [19](./docs/step-19-retry-and-circuit-breaker.md) | **重试与熔断**：Resilience4j 算子嵌套 + 流式重试闸门 + 失败路径的配额结算 |
 | [20](./docs/step-20-cross-provider-failover.md) | **跨 provider 故障转移**：候选链数据结构 + `failoverable` 谓词 + 请求级预算扣减 |
+| [21](./docs/step-21-task-based-routing.md) | **按任务选模型**：三层判定 + 规则分类器 + 任务映射表 + 开关只能有一个 |
 
 ---
 

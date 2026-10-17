@@ -14,6 +14,7 @@ import com.llmgw.core.protocol.UpstreamOutcome;
 import com.llmgw.core.quota.QuotaService;
 import com.llmgw.core.resilience.UpstreamResilience;
 import com.llmgw.core.router.ModelTier;
+import com.llmgw.core.router.Route;
 import com.llmgw.core.router.RouterService;
 import com.llmgw.core.token.TokenEstimator;
 import com.llmgw.observability.GatewayMetrics;
@@ -112,11 +113,16 @@ class ChatPipelineQuotaSettleTest {
         when(resilience.protect(anyString(), any(), anyInt())).thenAnswer(inv -> inv.getArgument(1));
         // 显式指定模型 → 不让路由自作主张升级（否则会静默产生贵模型账单）
         when(routerService.shouldEscalate(any(ModelTier.class), any(), anyBoolean())).thenReturn(false);
+        // 任务路由：本类测配额口径，路由固定成单模型。
+        // 不桩的话 resolve() 返回 null，第一阶段就 NPE —— 而报错会指向配额断言，
+        // 方向跑偏（和上面 name() 那个坑同一类）。
+        when(routerService.resolve(any())).thenReturn(
+                new Route(new ModelTier(MODEL, "CHEAP", 0.0, 0.5), "chat", "fallback", "test"));
     }
 
     private ChatRequest request() {
         return new ChatRequest(MODEL, false, 0.0, 64, null, null, null, null,
-                List.of(new ChatMessage("user", "什么是语义缓存")), "test");
+                List.of(new ChatMessage("user", "什么是语义缓存")), "test", null);
     }
 
     private long reserved() {
@@ -319,7 +325,7 @@ class ChatPipelineQuotaSettleTest {
         long single = estimator.estimateText("什么是语义缓存");
         ChatRequest multi = new ChatRequest(MODEL, false, 0.0, 64, null, null, null, null,
                 List.of(new ChatMessage("system", "你是一个严谨的技术助手，回答要给出具体例子。"),
-                        new ChatMessage("user", "什么是语义缓存")), "test");
+                        new ChatMessage("user", "什么是语义缓存")), "test", null);
 
         when(cacheService.lookup(anyString(), anyString())).thenReturn(Mono.empty());
         when(adapter.chat(eq(MODEL), any())).thenReturn(Mono.just(

@@ -30,6 +30,7 @@ import java.util.function.Supplier;
  *   llmgw.circuit.open              熔断器是否打开 0/1     ← F1 新增，tag: provider（Gauge）
  *   llmgw.circuit.rejected          因熔断被拦下的请求     ← F1 新增，tag: provider
  *   llmgw.upstream.failover         故障转移到下一个 provider ← F2 新增，tag: from / to
+ *   llmgw.route.task                路由决策计数，tag: task / source ← 任务路由新增
  *   llmgw.request.latency           延迟直方图，tag: model / stream
  * </pre>
  *
@@ -101,6 +102,16 @@ public class GatewayMetrics {
     private final ConcurrentMap<String, Counter> circuitRejectedByProvider = new ConcurrentHashMap<>();
     /** 键是 "from\u0000to"（用 NUL 而不是 "->" 拼接：provider 名里出现箭头字符时会撞键）。 */
     private final ConcurrentMap<String, Counter> failoverByPair = new ConcurrentHashMap<>();
+
+    /**
+     * 路由决策计数：task × source。键用 NUL 拼接，理由同 failover ——
+     * 标签值里出现分隔符（任务名恰好含箭头）会撞键。
+     *
+     * <p>为什么 task 要带上 source：同为 {@code code} 任务，"客户端明说的"
+     * 与"网关猜的"含义完全不同。只看 task 的分布，就分不清是配置生效了
+     * 还是推断规则太激进 —— 而这两件事的修法相反。
+     */
+    private final ConcurrentMap<String, Counter> routeByTask = new ConcurrentHashMap<>();
 
     public GatewayMetrics(MeterRegistry registry) {
         this.registry = registry;
@@ -192,6 +203,16 @@ public class GatewayMetrics {
                 .computeIfAbsent(key, k -> Counter.builder("llmgw.upstream.failover")
                         .tag("from", from)
                         .tag("to", to)
+                        .register(registry))
+                .increment();
+    }
+
+    public void onRoute(String task, String source) {
+        String key = task + "\u0000" + source;
+        routeByTask
+                .computeIfAbsent(key, k -> Counter.builder("llmgw.route.task")
+                        .tag("task", task)
+                        .tag("source", source)
                         .register(registry))
                 .increment();
     }

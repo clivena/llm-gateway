@@ -300,11 +300,56 @@ public class GatewayProperties {
     public static class Router {
         private String policy = "COST_FIRST";
         private List<Candidate> candidates = new ArrayList<>();
+        private TaskRouting taskRouting = new TaskRouting();
 
         public String getPolicy() { return policy; }
         public void setPolicy(String policy) { this.policy = policy; }
         public List<Candidate> getCandidates() { return candidates; }
         public void setCandidates(List<Candidate> candidates) { this.candidates = candidates; }
+        public TaskRouting getTaskRouting() { return taskRouting; }
+        public void setTaskRouting(TaskRouting taskRouting) { this.taskRouting = taskRouting; }
+    }
+
+    /**
+     * 按任务类型选模型。
+     *
+     * <p>与 {@code policy} 不是并列关系，而是<b>覆盖与兜底</b>：
+     * 任务命中就用任务表里的模型，没命中才落回 policy。所以这里
+     * <b>不能</b>再保留一个 {@code policy=TASK_BASED} —— 同一件事有两个开关，
+     * 四种组合里必有两种语义不明（policy 说按任务、开关说关闭，听谁的？）。
+     * 开关只能有一个。
+     *
+     * <p>为什么 {@code model} 必须来自 {@code candidates}：不在候选表里的模型
+     * 没有 qualityScore，级联升级会找不到"更强档位"，表现为<b>静默永不升级</b>
+     * 而不是报错。这类结构性错误只有启动期才能拦，故由 RouterService 校验。
+     *
+     * <p>默认 {@code enabled=false}：没配映射表就开启，等于所有请求都落
+     * default-task，而 default-task 又必须在表里声明 —— 结果是启动失败。
+     * 能力默认关闭，用的人显式打开，这样"clone 下来直接能起"不被破坏。
+     */
+    public static class TaskRouting {
+        private boolean enabled = false;
+        private String defaultTask = "chat";
+        /** rule | off。model 是预留值，当前未实现。 */
+        private String classifier = "rule";
+        private Map<String, TaskRule> tasks = new LinkedHashMap<>();
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        public String getDefaultTask() { return defaultTask; }
+        public void setDefaultTask(String defaultTask) { this.defaultTask = defaultTask; }
+        public String getClassifier() { return classifier; }
+        public void setClassifier(String classifier) { this.classifier = classifier; }
+        public Map<String, TaskRule> getTasks() { return tasks; }
+        public void setTasks(Map<String, TaskRule> tasks) { this.tasks = tasks; }
+    }
+
+    /** 一个任务对应的模型。升级路径不在这里定义 —— 它由 candidates 的 qualityScore 全局决定。 */
+    public static class TaskRule {
+        private String model;
+
+        public String getModel() { return model; }
+        public void setModel(String model) { this.model = model; }
     }
 
     /**

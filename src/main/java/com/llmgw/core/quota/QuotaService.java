@@ -1,6 +1,7 @@
 package com.llmgw.core.quota;
 
 import com.llmgw.config.GatewayProperties;
+import com.llmgw.observability.LogMask;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.io.ClassPathResource;
@@ -73,7 +74,7 @@ public class QuotaService {
                 .defaultIfEmpty(false)
                 .doOnNext(allowed -> {
                     if (!allowed) {
-                        log.info("quota exceeded: key={} need={}", key, tokens);
+                        log.info("quota exceeded: key={} need={}", LogMask.of(key), tokens);
                     }
                 })
                 .onErrorResume(e -> {
@@ -104,10 +105,10 @@ public class QuotaService {
                     if (finalUsed < 0) {
                         // 周期翻篇，跳过。debug 而不是 warn —— 这是每月会发生一次的
                         // 正常边界，不是异常。
-                        log.debug("quota settle skipped (period rolled over): key={} delta={}", key, delta);
+                        log.debug("quota settle skipped (period rolled over): key={} delta={}", LogMask.of(key), delta);
                     } else {
                         log.debug("quota settled: key={} reserved={} actual={} delta={} used={}",
-                                key, reserved, actual, delta, finalUsed);
+                                LogMask.of(key), reserved, actual, delta, finalUsed);
                     }
                 });
         // 刻意**不在这里吞异常**：结算失败该如何处置是调用方的决定

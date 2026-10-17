@@ -5,10 +5,10 @@
 > | 项    | 值                                                                              |
 > | ---- | ------------------------------------------------------------------------------ |
 > | 对应提交 | 2026-10-17（F3 任务路由 → step-22 复查 → R2 留证 → P7 链路归因 → 运维鉴权）    |
-> | 生产代码 | 45 个 Java 类 · 6134 行（`src/main/java`）                                          |
-> | 测试代码 | 24 个测试类 · 210 passed / 0 failures / 0 errors                                   |
+> | 生产代码 | 46 个 Java 类 · 6177 行（`src/main/java`）                                          |
+> | 测试代码 | 25 个测试类 · 216 passed / 0 failures / 0 errors                                   |
 > | 真机脚本 | 11 个 Python 脚本（`scripts/`）                                                     |
-> | 步骤文档 | 21 篇 step + 索引，共 4369 行（`docs/`）                                            |
+> | 步骤文档 | 21 篇 step + 索引，共 4398 行（`docs/`）                                            |
 > | 中间件  | Redis(+Lua/RediSearch) · PostgreSQL(R2DBC) · Kafka · Resilience4j · Micrometer |
 >
 > 文中所有数字都可复现。复现方式见第 7 节。
@@ -329,7 +329,7 @@ return 0                        -- 放行并预扣
 
 | 项 | 结果 |
 |---|---|
-| 单测 | **210 passed / 0 failures / 0 errors**（`mvn -o clean test`） |
+| 单测 | **216 passed / 0 failures / 0 errors**（`mvn -o clean test`） |
 | 配额原子性 | 20 并发 / 上限 50 / 预扣 7 → 7 放行 13 拒绝，终值 49 |
 | 缓存命中 | 命中快 250~400 倍，`usage` 全 0/0，三重交叉验证 |
 | Token 估算 | 六组探针，估算/真实 = 1.00 / 1.00 / 1.03 / 1.02 / 1.00 / 1.01 |
@@ -365,7 +365,7 @@ cp config/application-local.yml.example config/application-local.yml
 # 填入自己的 key
 
 # 3) 全量单测
-mvn -o clean test                      # 期望 210 passed
+mvn -o clean test                      # 期望 216 passed
 
 # 4) 真机联调（自己起服务、跑断言、收指标、关服务）
 python scripts/run-gateway-smoke.py

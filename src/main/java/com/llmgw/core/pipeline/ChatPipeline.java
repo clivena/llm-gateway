@@ -21,6 +21,7 @@ import com.llmgw.core.router.RouteTrace;
 import com.llmgw.core.router.RouterService;
 import com.llmgw.core.token.TokenEstimator;
 import com.llmgw.observability.GatewayMetrics;
+import com.llmgw.observability.LogMask;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -1007,7 +1008,7 @@ public class ChatPipeline {
                 .onErrorResume(e -> {
                     metrics.onQuotaSettleFailed();
                     log.warn("quota settle failed [apiKey={} reserved={} actual={}]: {}",
-                            apiKey, reserved, actual, e.toString());
+                            LogMask.of(apiKey), reserved, actual, e.toString());
                     return Mono.empty();
                 })
                 .then();
